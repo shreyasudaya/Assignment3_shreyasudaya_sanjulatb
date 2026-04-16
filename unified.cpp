@@ -20,16 +20,15 @@
 using namespace llvm;
 
 namespace {
-std::string getShortValueName(const Value* V) {
-  if (!V) return "(null)";
-  if (V->hasName()) return "%" + V->getName().str();
-  if (const auto* C = dyn_cast<ConstantInt>(V)) return std::to_string(C->getSExtValue());
-  std::string S;
-  raw_string_ostream OS(S);
-  V->printAsOperand(OS, false);
-  return S;
-}
-
+  std::string getShortValueName(const Value* V) {
+    if (!V) return "(null)";
+    if (V->hasName()) return "%" + V->getName().str();
+    if (const auto* C = dyn_cast<ConstantInt>(V)) return std::to_string(C->getSExtValue());
+    std::string S;
+    raw_string_ostream OS(S);
+    V->printAsOperand(OS, false);
+    return S;
+  }
 } //namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
@@ -38,7 +37,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
     [](PassBuilder& PB) {
       PB.registerPipelineParsingCallback(
         [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "dominator-analysis") {
+          if (Name == "dominator") {
             FPM.addPass(DominatorAnalysis());
             return true;
           }
