@@ -6,7 +6,7 @@ DEPDIR       = $(BUILDDIR)/.deps
 DEPFLAGS     = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
 
 TESTS             = dominator dce licm
-OPTIMIZER_SOURCES = dominators.cpp dce.cpp licm.cpp
+OPTIMIZER_SOURCES = unified.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 TESTS_PRE         = $(TESTS:%=$(BUILDDIR)/tests/%-m2r.ll)
 TESTS_OUT         = $(TESTS:%=$(BUILDDIR)/tests/%-opt.ll)
