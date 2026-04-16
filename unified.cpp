@@ -30,51 +30,51 @@ namespace {
     return S;
   }
   struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
-      //BB and indices
-      std::vector<BasicBlock*> blocks;
-      DenseMap<BasicBlock*, unsigned> blockIndices;
-      for (auto& BB : F) {
-        blockIndices[&BB] = blocks.size();
-        blocks.push_back(&BB);
-      }
-      unsigned N = blocks.size();
-
-      //Dom sets
-      std::vector<BitVector> doms(N, BitVector(N, true));
-      doms[0].reset(); 
-
-      // Compute dominators using a fixed-point iteration
-      bool changed;
-      do {
-        changed = false;
-        for (unsigned i = 1; i < N; ++i) {
-          BitVector newDoms = doms[i];
-          for (auto* pred : predecessors(blocks[i])) {
-            newDoms &= doms[blockIndices[pred]];
-          }
-          newDoms.set(i); // A block always dominates itself
-          if (newDoms != doms[i]) {
-            doms[i] = newDoms;
-            changed = true;
-          }
+      PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
+        //BB and indices
+        std::vector<BasicBlock*> blocks;
+        DenseMap<BasicBlock*, unsigned> blockIndices;
+        for (auto& BB : F) {
+          blockIndices[&BB] = blocks.size();
+          blocks.push_back(&BB);
         }
-      } while (changed);
+        unsigned N = blocks.size();
 
-      // Print results
-      for (unsigned i = 0; i < N; ++i) {
-        errs() << "Block " << getShortValueName(blocks[i]) << " is dominated by: ";
-        for (unsigned j = 0; j < N; ++j) {
-          if (doms[i][j]) {
-            errs() << getShortValueName(blocks[j]) << " ";
+        //Dom sets
+        std::vector<BitVector> doms(N, BitVector(N, true));
+        doms[0].reset(); 
+
+        // Compute dominators using a fixed-point iteration
+        bool changed;
+        do {
+          changed = false;
+          for (unsigned i = 1; i < N; ++i) {
+            BitVector newDoms = doms[i];
+            for (auto* pred : predecessors(blocks[i])) {
+              newDoms &= doms[blockIndices[pred]];
+            }
+            newDoms.set(i); // A block always dominates itself
+            if (newDoms != doms[i]) {
+              doms[i] = newDoms;
+              changed = true;
+            }
           }
-        }
-        errs() << "\n";
-      }
+        } while (changed);
 
-      return PreservedAnalyses::all();
-    }
-  };
+        // Print results
+        for (unsigned i = 0; i < N; ++i) {
+          errs() << "Block " << getShortValueName(blocks[i]) << " is dominated by: ";
+          for (unsigned j = 0; j < N; ++j) {
+            if (doms[i][j]) {
+              errs() << getShortValueName(blocks[j]) << " ";
+            }
+          }
+          errs() << "\n";
+        }
+
+        return PreservedAnalyses::all();
+      }
+    };
 } //namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
