@@ -1,49 +1,72 @@
+# --- Tools ---
 CXX          = clang++
 LLVM_CONFIG  = llvm-config
 
+# --- Flags ---
+# -g is included to help preserve some naming metadata
 CXXFLAGS     = -rdynamic $(shell $(LLVM_CONFIG) --cxxflags) -fPIC -g -std=c++20
 LDFLAGS      = $(shell $(LLVM_CONFIG) --ldflags | tr '\n' ' ') -Wl,--exclude-libs,ALL
 
+# --- Directories ---
 BUILDDIR     = build
 DEPDIR       = $(BUILDDIR)/.deps
+TESTDIR      = $(BUILDDIR)/tests
 
+# --- Pass/Plugin ---
+# Ensure this matches your .cpp filename exactly!
+OPTIMIZER_SOURCES = unified.cpp
+OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
+
+# --- Tests ---
+TESTS        = dead-code-elimination dominator licm
+TESTS_PRE    = $(TESTS:%=$(TESTDIR)/%-m2r.ll)
+TESTS_OUT    = $(TESTS:%=$(TESTDIR)/%-opt.ll)
+
+# --- Dependency Management ---
 DEPFLAGS     = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
-
-TESTS        = dominator dce licm
-
-PLUGIN_SRC   = unified.cpp
-PLUGIN       = $(BUILDDIR)/unified.so
-
-DEPFILES     = $(PLUGIN_SRC:%.cpp=$(DEPDIR)/%.d)
+DEPFILES     = $(OPTIMIZER_SOURCES:%.cpp=$(DEPDIR)/%.d)
 
 .PHONY: all clean tests
+.SECONDARY: # This ensures Make doesn't delete your intermediate .bc files
 
+all: $(OPTIMIZER_LIBS)
 
-all: $(PLUGIN)
+tests: $(TESTS_PRE) $(TESTS_OUT)
 
-tests: $(TESTS:%=$(BUILDDIR)/tests/%.ll)
+clean:
+	rm -rf $(BUILDDIR)
 
-$(BUILDDIR)/%.o: %.cpp $(DEPDIR)/%.d | $(DEPDIR) $(BUILDDIR)
+# --- 1. Compile the Plugin ---
+$(BUILDDIR)/%.o: %.cpp | $(DEPDIR) $(BUILDDIR)
 	$(CXX) $(DEPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILDDIR)/%.so: $(BUILDDIR)/%.o
 	$(CXX) -shared $^ -o $@ $(LDFLAGS)
 
+# --- 2. The Test Pipeline ---
 
-$(BUILDDIR)/tests/%.bc: tests/%.c | $(BUILDDIR)/tests
-	clang -O0 -Xclang -disable-O0-optnone -emit-llvm -c $< -o $@
+# Step A: C -> Raw Bitcode (Allocas/Loads/Stores)
+$(TESTDIR)/%.bc: tests/%.c | $(TESTDIR)
+	clang -O0 -Xclang -disable-O0-optnone -fno-discard-value-names -emit-llvm -c $< -o $@
 
-$(BUILDDIR)/tests/%-opt.bc: $(BUILDDIR)/tests/%.bc $(PLUGIN) | $(BUILDDIR)/tests
-	opt -load-pass-plugin=$(PLUGIN) \
-	    -passes=$* $< -o $@
+# Step B: Raw Bitcode -> SSA Bitcode (Virtual Registers & PHI nodes)
+# This uses the built-in mem2reg pass
+$(TESTDIR)/%-m2r.bc: $(TESTDIR)/%.bc
+	opt -passes=mem2reg $< -o $@
 
-$(BUILDDIR)/tests/%.ll: $(BUILDDIR)/tests/%-opt.bc | $(BUILDDIR)/tests
+# Step C: SSA Bitcode -> Optimized Bitcode (Running your Plugin)
+$(TESTDIR)/%-opt.bc: $(TESTDIR)/%-m2r.bc $(OPTIMIZER_LIBS)
+	opt $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) -passes='$*' $< -o $@
+
+# Step D: Bitcode -> Human Readable IR (.ll files)
+$(TESTDIR)/%-opt.ll: $(TESTDIR)/%-opt.bc
 	llvm-dis $< -o $@
 
-$(BUILDDIR) $(BUILDDIR)/tests $(DEPDIR):
-	mkdir -p $@
+$(TESTDIR)/%-m2r.ll: $(TESTDIR)/%-m2r.bc
+	llvm-dis $< -o $@
 
-clean:
-	rm -rf $(BUILDDIR)
+# --- Helpers ---
+$(DEPDIR) $(BUILDDIR) $(TESTDIR):
+	@mkdir -p $@
 
 -include $(wildcard $(DEPFILES))
