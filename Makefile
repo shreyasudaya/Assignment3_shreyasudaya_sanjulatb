@@ -14,7 +14,7 @@ TESTDIR      = $(BUILDDIR)/tests
 
 # --- Pass/Plugin ---
 # Ensure this matches your .cpp filename exactly!
-OPTIMIZER_SOURCES = unified.cpp
+OPTIMIZER_SOURCES = unifiedpass.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 
 # --- Tests ---
