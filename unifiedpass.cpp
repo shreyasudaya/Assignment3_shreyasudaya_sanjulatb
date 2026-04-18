@@ -45,53 +45,81 @@ namespace {
   }
 
   struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
-      PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
-        //BB and indices
-        std::vector<BasicBlock*> blocks;
-        DenseMap<BasicBlock*, unsigned> blockIndices;
-        for (auto& BB : F) {
-          blockIndices[&BB] = blocks.size();
-          blocks.push_back(&BB);
-        }
-        unsigned N = blocks.size();
-
-        //Dom sets
-        std::vector<BitVector> doms(N, BitVector(N, true));
-        doms[0].reset(); 
-
-        // Compute dominators using a fixed-point iteration
-        bool changed;
-        do {
-          changed = false;
-          for (unsigned i = 1; i < N; ++i) {
-            BitVector newDoms = doms[i];
-            for (auto* pred : predecessors(blocks[i])) {
-              newDoms &= doms[blockIndices[pred]];
-            }
-            newDoms.set(i); // A block always dominates itself
-            if (newDoms != doms[i]) {
-              doms[i] = newDoms;
-              changed = true;
-            }
-          }
-        } while (changed);
-
-        // Print results
-        for (unsigned i = 0; i < N; ++i) {
-          errs() << "Block " << getShortValueName(blocks[i]) << " is dominated by: ";
-          for (unsigned j = 0; j < N; ++j) {
-            if (doms[i][j]) {
-              errs() << getShortValueName(blocks[j]) << " ";
-            }
-          }
-          errs() << "\n";
-        }
-
-        return PreservedAnalyses::all();
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
+      //BB and indices
+      std::vector<BasicBlock*> blocks;
+      DenseMap<BasicBlock*, unsigned> blockIndices;
+      for (auto& BB : F) {
+        blockIndices[&BB] = blocks.size();
+        blocks.push_back(&BB);
       }
+      unsigned N = blocks.size();
+      if (N == 0) return PreservedAnalyses::all();
+
+      // Initialization for Dominators:
+      // Dom(Entry) = {Entry}
+      // Dom(Others) = {All Nodes}
+      std::vector<BitVector> doms(N, BitVector(N, true));
+      doms[0].reset();
+      doms[0].set(0); 
+
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        // Iterate over all blocks except the entry block
+        for (unsigned i = 1; i < N; ++i) {
+          BitVector newDoms(N, true); // Universal set for intersection
+          bool hasPreds = false;
+
+          for (auto* pred : predecessors(blocks[i])) {
+            newDoms &= doms[blockIndices[pred]];
+            hasPreds = true;
+          }
+
+          // If a block has no predecessors and isn't the entry, it dominates nothing but itself
+          if (!hasPreds) newDoms.reset();
+
+          newDoms.set(i); // A block always dominates itself
+          
+          if (newDoms != doms[i]) {
+            doms[i] = newDoms;
+            changed = true;
+          }
+        }
+      }
+
+      // Print results
+      // Step 2: Filter and Print Immediate Dominators (IDoms)
+      for (unsigned i = 0; i < N; ++i) {
+        errs() << "Block " << getShortValueName(blocks[i]) << " is dominated by: ";
+        
+        for (unsigned d = 0; d < N; ++d) {
+          // A node d is IDom(i) if d strictly dominates i AND
+          // there is no other strict dominator 's' such that d dominates s.
+          if (d == i || !doms[i].test(d)) continue; 
+
+          bool isImmediate = true;
+          for (unsigned s = 0; s < N; ++s) {
+            if (s == i || s == d || !doms[i].test(s)) continue;
+            // If d dominates another strict dominator s, then s is "closer" to i than d is.
+            if (doms[s].test(d)) {
+              isImmediate = false;
+              break;
+            }
+          }
+
+          if (isImmediate) {
+            errs() << getShortValueName(blocks[d]) << " ";
+          }
+        }
+        errs() << "\n";
+      }
+
+      return PreservedAnalyses::all();
+    }
   };
 
-  struct DCEPass : PassInfoMixin<DCEPass> {
+ struct DCEPass : PassInfoMixin<DCEPass> {
     //Liveness conditions
     static bool isLive(const Instruction* I) {
       if (I->isTerminator()) return true;
