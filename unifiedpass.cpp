@@ -44,51 +44,103 @@ namespace {
     OS << " }\n";
   }
 
+  
   struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
-      PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
-        //BB and indices
-        std::vector<BasicBlock*> blocks;
-        DenseMap<BasicBlock*, unsigned> blockIndices;
-        for (auto& BB : F) {
-          blockIndices[&BB] = blocks.size();
-          blocks.push_back(&BB);
-        }
-        unsigned N = blocks.size();
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
 
-        //Dom sets
-        std::vector<BitVector> doms(N, BitVector(N, true));
-        doms[0].reset(); 
+      //DFS NUMBERING
+      std::vector<BasicBlock*> vertex;
+      DenseMap<BasicBlock*, int> index;
 
-        // Compute dominators using a fixed-point iteration
-        bool changed;
-        do {
-          changed = false;
-          for (unsigned i = 1; i < N; ++i) {
-            BitVector newDoms = doms[i];
-            for (auto* pred : predecessors(blocks[i])) {
-              newDoms &= doms[blockIndices[pred]];
-            }
-            newDoms.set(i); // A block always dominates itself
-            if (newDoms != doms[i]) {
-              doms[i] = newDoms;
-              changed = true;
-            }
+      std::vector<int> parent;
+      int N = 0;
+
+      std::function<void(BasicBlock*)> dfs = [&](BasicBlock* v) {
+        index[v] = N++;
+        vertex.push_back(v);
+        parent.push_back(-1);
+
+        for (auto* succ : successors(v)) {
+          if (!index.count(succ)) {
+            parent.push_back(index[v]); 
+            dfs(succ);
+            parent[index[succ]] = index[v];
           }
-        } while (changed);
-
-        // Print results
-        for (unsigned i = 0; i < N; ++i) {
-          errs() << "Block " << getShortValueName(blocks[i]) << " is dominated by: ";
-          for (unsigned j = 0; j < N; ++j) {
-            if (doms[i][j]) {
-              errs() << getShortValueName(blocks[j]) << " ";
-            }
-          }
-          errs() << "\n";
         }
+      };
 
-        return PreservedAnalyses::all();
+      BasicBlock* entry = &F.getEntryBlock();
+      dfs(entry);
+
+      // Resize arrays
+      std::vector<int> semi(N), idom(N, -1), ancestor(N, -1), label(N);
+      std::vector<std::vector<int>> bucket(N);
+
+      for (int i = 0; i < N; ++i) {
+        semi[i] = i;
+        label[i] = i;
       }
+
+      //Union helpers
+      std::function<void(int)> compress = [&](int v) {
+        if (ancestor[ancestor[v]] != -1) {
+          compress(ancestor[v]);
+          if (semi[label[ancestor[v]]] < semi[label[v]])
+            label[v] = label[ancestor[v]];
+          ancestor[v] = ancestor[ancestor[v]];
+        }
+      };
+
+      std::function<int(int)> eval = [&](int v) -> int {
+        if (ancestor[v] == -1)
+          return label[v];
+        compress(v);
+        return label[v];
+      };
+
+      auto link = [&](int v, int w) {
+        ancestor[w] = v;
+      };
+
+      //Lengar-Tarjan Algorithm
+      for (int w = N - 1; w > 0; --w) {
+        BasicBlock* BB = vertex[w];
+
+        //Compute semi-dominator
+        for (auto* pred : predecessors(BB)) {
+          if (!index.count(pred)) continue;
+          int v = index[pred];
+          int u = eval(v);
+          semi[w] = std::min(semi[w], semi[u]);
+        }
+
+        bucket[semi[w]].push_back(w);
+        link(parent[w], w);
+
+        //Process Bucket
+        for (int v : bucket[parent[w]]) {
+          int u = eval(v);
+          if (semi[u] < semi[v])
+            idom[v] = u;
+          else
+            idom[v] = parent[w];
+        }
+      }
+
+      //Finalize idominators
+      for (int i = 1; i < N; ++i) {
+        if (idom[i] != semi[i])
+          idom[i] = idom[idom[i]];
+      }
+
+      for (int i = 1; i < N; ++i) {
+        errs() << "Block " << getShortValueName(vertex[i])
+              << " is dominated by "
+              << getShortValueName(vertex[idom[i]]) << "\n";
+      }
+
+      return PreservedAnalyses::all();
+    }
   };
 
   struct DCEPass : PassInfoMixin<DCEPass> {
