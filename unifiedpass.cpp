@@ -313,18 +313,27 @@ namespace {
 
   struct MyLICMSafetyPass : PassInfoMixin<MyLICMSafetyPass> {
     // TWEAK: Explicitly ignore PHI nodes to prevent breaking SSA form during hoisting
-    bool isInstructionInvariant(Instruction &I, Loop &L) {
-      if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
-          return false; 
-      for (Value *Op : I.operands()) {
-        if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
-        if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
-          if (L.contains(OpInst->getParent())) return false;
-          continue;
+    // Added DenseSet to track instructions queued for hoisting
+    bool isInstructionInvariant(Instruction &I, Loop &L, const DenseSet<Instruction*> &HoistedSet) {
+        if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
+            return false;
+        
+        // Explicitly check for side effects or memory reads
+        if (I.mayReadFromMemory() || I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
+            return false;
+
+        for (Value *Op : I.operands()) {
+            if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
+            if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+                // An operand is valid if it's defined outside the loop 
+                // OR if it's already in our 'to-be-hoisted' set.
+                if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst)) 
+                    return false;
+                continue;
+            }
+            return false;
         }
-        return false;
-      }
-      return true;
+        return true;
     }
 
 
@@ -426,14 +435,13 @@ namespace {
     }
     
     PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
-                         LoopStandardAnalysisResults &AR, LPMUpdater &U) {
-        
+                      LoopStandardAnalysisResults &AR, LPMUpdater &U) {
+    
       Function *F = L.getHeader()->getParent();
       
       // 1. Rotate the loop (Using the fixed logic from the previous step)
       rotateLoop(L, AR);
 
-      // 2. Get the preheader. If it doesn't exist, we have nowhere to hoist to!
       BasicBlock *Preheader = L.getLoopPreheader();
       if (!Preheader) {
           errs() << "Skipping: No preheader available for hoisting.\n";
@@ -443,51 +451,64 @@ namespace {
       SmallVector<BasicBlock *, 4> ExitingBlocks;
       L.getExitingBlocks(ExitingBlocks);
 
-      // 3. Create a worklist to avoid iterator invalidation
-      SmallVector<Instruction *, 16> InstructionsToHoist;
+      // --- NEW: Iterative Logic Structures ---
+      SmallVector<Instruction *, 16> Worklist;
+      DenseSet<Instruction *> HoistedSet;        // Tracks what will be moved
+      SmallVector<Instruction *, 16> OrderedHoist; // Maintains dependency order
 
       errs() << "\n--- Analyzing Rotated Loop: " << L.getHeader()->getName() << " ---\n";
 
-      // 4. Identify safe instructions
-      for (BasicBlock *BB : L.getBlocks()) {
-          for (Instruction &I : *BB) {
-              if (isInstructionInvariant(I, L)) {
-                  
-                  bool dominatesAllExits = true;
-                  for (BasicBlock *EB : ExitingBlocks) {
-                      if (!AR.DT.dominates(&I, EB->getTerminator())) {
-                          dominatesAllExits = false;
-                          break;
-                      }
-                  }
+      // Initialize worklist with all instructions
+      for (BasicBlock *BB : L.getBlocks())
+          for (Instruction &I : *BB)
+              Worklist.push_back(&I);
 
-                  if (dominatesAllExits) {
-                      errs() << "    [SAFE - MARKED FOR HOISTING] " << I << "\n";
-                      InstructionsToHoist.push_back(&I);
-                  } else {
-                      errs() << "    [UNSAFE] Does not dominate all exits: " << I << "\n";
+      // Iteratively process the worklist
+      while (!Worklist.empty()) {
+          Instruction *I = Worklist.pop_back_val();
+
+          // Skip if already marked or is a PHI/Terminator (handled by isInstructionInvariant)
+          if (HoistedSet.count(I)) continue;
+
+          // TWEAK: Pass HoistedSet to check if operands are "effectively" invariant
+          if (isInstructionInvariant(*I, L, HoistedSet)) {
+              
+              bool dominatesAllExits = true;
+              for (BasicBlock *EB : ExitingBlocks) {
+                  if (!AR.DT.dominates(I, EB->getTerminator())) {
+                      dominatesAllExits = false;
+                      break;
                   }
+              }
+
+              if (dominatesAllExits) {
+                  errs() << "    [SAFE - MARKED FOR HOISTING] " << *I << "\n";
+                  HoistedSet.insert(I);
+                  OrderedHoist.push_back(I);
+
+                  // Since I is now invariant, its users might become invariant too
+                  for (User *U : I->users())
+                      if (auto *UI = dyn_cast<Instruction>(U))
+                          if (L.contains(UI->getParent()))
+                              Worklist.push_back(UI);
+              } else {
+                  errs() << "    [UNSAFE] Does not dominate all exits: " << *I << "\n";
               }
           }
       }
-
-      // 5. Hoist the instructions!
-      if (InstructionsToHoist.empty()) {
-          return PreservedAnalyses::all(); // Nothing changed
+      if (OrderedHoist.empty()) {
+          return PreservedAnalyses::all();
       }
 
+      // Hoist in discovered order to preserve dependencies
       Instruction *PreheaderTerminator = Preheader->getTerminator();
-      for (Instruction *Inst : InstructionsToHoist) {
-          // Physically move the instruction from the loop body to the preheader
+      for (Instruction *Inst : OrderedHoist) {
           Inst->moveBefore(PreheaderTerminator);
       }
 
-      errs() << "--- Successfully hoisted " << InstructionsToHoist.size() << " instructions. ---\n";
-
-      // The CFG hasn't changed since rotation, but we moved instructions.
-      // Depending on your LLVM version, PreservedAnalyses::none() is the safest bet.
+      errs() << "--- Successfully hoisted " << OrderedHoist.size() << " instructions. ---\n";
       return PreservedAnalyses::none();
-    }
+  }
   };
 
 } //namespace
