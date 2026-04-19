@@ -1,14 +1,15 @@
 #include <algorithm>
-#include <cstdint>
-#include <numeric>
+#include <functional>
 #include <string>
 #include <vector>
 
-#include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/CFG.h>
-#include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
@@ -16,7 +17,6 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/raw_ostream.h>
-#include "llvm/Analysis/ValueTracking.h"
 using namespace llvm;
 
 namespace {
@@ -45,103 +45,135 @@ namespace {
   }
 
   
-  struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
+  struct DominatorAnalysis : PassInfoMixin<DominatorAnalysis> {
 
-      //DFS NUMBERING
-      std::vector<BasicBlock*> vertex;
-      DenseMap<BasicBlock*, int> index;
+    // ------------------------------------------------------------------
+    // All dominator state needed by LICM, returned as a plain struct
+    // so LICM can call computeDominators() without running a pass
+    // ------------------------------------------------------------------
+    struct Result {
+        std::vector<BasicBlock*>   vertex;   // vertex[i] = BB at DFS index i
+        DenseMap<BasicBlock*, int> index;    // BB -> DFS index
+        std::vector<int>           idom;     // idom[i] = DFS index of idom(i)
+    };
 
-      std::vector<int> parent;
-      int N = 0;
+    // ------------------------------------------------------------------
+    // Your Lengauer-Tarjan implementation, refactored into a static
+    // function so LICMPass can call it directly
+    // ------------------------------------------------------------------
+    static Result computeDominators(Function& F) {
+        Result R;
+        std::vector<int> parent;
+        int N = 0;
 
-      std::function<void(BasicBlock*)> dfs = [&](BasicBlock* v) {
-        index[v] = N++;
-        vertex.push_back(v);
-        parent.push_back(-1);
+        // ---- DFS numbering (fixed: pass parent explicitly) ----
+        std::function<void(BasicBlock*, int)> dfs = [&](BasicBlock* v, int par) {
+            R.index[v] = N++;
+            R.vertex.push_back(v);
+            parent.push_back(par);
+            for (BasicBlock* succ : successors(v))
+                if (!R.index.count(succ))
+                    dfs(succ, R.index[v]);
+        };
+        dfs(&F.getEntryBlock(), -1);
 
-        for (auto* succ : successors(v)) {
-          if (!index.count(succ)) {
-            parent.push_back(index[v]); 
-            dfs(succ);
-            parent[index[succ]] = index[v];
-          }
+        // ---- Initialize arrays ----
+        std::vector<int> semi(N), idom(N, -1), ancestor(N, -1), label(N);
+        std::vector<std::vector<int>> bucket(N);
+        for (int i = 0; i < N; ++i) { semi[i] = i; label[i] = i; }
+
+        // ---- Path compression (your compress, fixed guard) ----
+        std::function<void(int)> compress = [&](int v) {
+            if (ancestor[v] != -1 && ancestor[ancestor[v]] != -1) {
+                compress(ancestor[v]);
+                if (semi[label[ancestor[v]]] < semi[label[v]])
+                    label[v] = label[ancestor[v]];
+                ancestor[v] = ancestor[ancestor[v]];
+            }
+        };
+
+        auto eval = [&](int v) -> int {
+            if (ancestor[v] == -1) return label[v];
+            compress(v);
+            return label[v];
+        };
+
+        // ---- Lengauer-Tarjan main loop (your logic, unchanged) ----
+        for (int w = N - 1; w > 0; --w) {
+            BasicBlock* BB = R.vertex[w];
+
+            // Compute semidominator
+            for (BasicBlock* pred : predecessors(BB)) {
+                if (!R.index.count(pred)) continue;
+                int v = R.index[pred];
+                int u = eval(v);
+                semi[w] = std::min(semi[w], semi[u]);
+            }
+
+            bucket[semi[w]].push_back(w);
+            ancestor[w] = parent[w];   // link(parent[w], w)
+
+            // Process bucket
+            for (int v : bucket[parent[w]]) {
+                int u = eval(v);
+                idom[v] = (semi[u] < semi[v]) ? u : parent[w];
+            }
+            bucket[parent[w]].clear();
         }
-      };
 
-      BasicBlock* entry = &F.getEntryBlock();
-      dfs(entry);
+        // Finalize (your logic, unchanged)
+        for (int i = 1; i < N; ++i)
+            if (idom[i] != semi[i])
+                idom[i] = idom[idom[i]];
 
-      // Resize arrays
-      std::vector<int> semi(N), idom(N, -1), ancestor(N, -1), label(N);
-      std::vector<std::vector<int>> bucket(N);
-
-      for (int i = 0; i < N; ++i) {
-        semi[i] = i;
-        label[i] = i;
-      }
-
-      //Union helpers
-      std::function<void(int)> compress = [&](int v) {
-        if (ancestor[ancestor[v]] != -1) {
-          compress(ancestor[v]);
-          if (semi[label[ancestor[v]]] < semi[label[v]])
-            label[v] = label[ancestor[v]];
-          ancestor[v] = ancestor[ancestor[v]];
-        }
-      };
-
-      std::function<int(int)> eval = [&](int v) -> int {
-        if (ancestor[v] == -1)
-          return label[v];
-        compress(v);
-        return label[v];
-      };
-
-      auto link = [&](int v, int w) {
-        ancestor[w] = v;
-      };
-
-      //Lengar-Tarjan Algorithm
-      for (int w = N - 1; w > 0; --w) {
-        BasicBlock* BB = vertex[w];
-
-        //Compute semi-dominator
-        for (auto* pred : predecessors(BB)) {
-          if (!index.count(pred)) continue;
-          int v = index[pred];
-          int u = eval(v);
-          semi[w] = std::min(semi[w], semi[u]);
-        }
-
-        bucket[semi[w]].push_back(w);
-        link(parent[w], w);
-
-        //Process Bucket
-        for (int v : bucket[parent[w]]) {
-          int u = eval(v);
-          if (semi[u] < semi[v])
-            idom[v] = u;
-          else
-            idom[v] = parent[w];
-        }
-      }
-
-      //Finalize idominators
-      for (int i = 1; i < N; ++i) {
-        if (idom[i] != semi[i])
-          idom[i] = idom[idom[i]];
-      }
-
-      for (int i = 1; i < N; ++i) {
-        errs() << "Block " << getShortValueName(vertex[i])
-              << " is dominated by "
-              << getShortValueName(vertex[idom[i]]) << "\n";
-      }
-
-      return PreservedAnalyses::all();
+        R.idom = idom;
+        return R;
     }
-  };
+
+    // ------------------------------------------------------------------
+    // dominates(): walks idom chain from B upward looking for A
+    // ------------------------------------------------------------------
+    static bool dominates(BasicBlock* A, BasicBlock* B, const Result& R) {
+        if (A == B) return true;
+        auto it = R.index.find(B);
+        if (it == R.index.end()) return false;
+        int cur = it->second;
+        while (cur > 0) {
+            cur = R.idom[cur];
+            if (cur < 0) break;
+            if (R.vertex[cur] == A) return true;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Pass entry point: prints idom for each block (your original output)
+    // ------------------------------------------------------------------
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+        auto& LI = FAM.getResult<LoopAnalysis>(F);
+        Result R  = computeDominators(F);
+
+        errs() << "=== Dominators: " << F.getName() << " ===\n";
+
+        for (Loop* L : LI) {
+            errs() << "Loop header: " << getShortValueName(L->getHeader()) << "\n";
+            for (BasicBlock* BB : L->blocks()) {
+                auto it = R.index.find(BB);
+                if (it == R.index.end()) continue;
+                int idx = it->second;
+                if (idx == 0) {
+                    errs() << "  " << getShortValueName(BB) << " idom: (entry)\n";
+                    continue;
+                }
+                BasicBlock* idomBB = R.vertex[R.idom[idx]];
+                errs() << "  " << getShortValueName(BB)
+                       << " idom: " << getShortValueName(idomBB) << "\n";
+            }
+        }
+
+        return PreservedAnalyses::all();
+    }
+};
 
   struct DCEPass : PassInfoMixin<DCEPass> {
     //Liveness conditions
@@ -275,242 +307,370 @@ namespace {
     }
   };
 
+
+  // ============================================================================
+  // LICM PASS
+  // ============================================================================
   struct LICMPass : PassInfoMixin<LICMPass> {
 
-    // ------------------------------------------------------------
-    // Invariant candidate check
-    // ------------------------------------------------------------
-    static bool isInvariantCandidate(const Instruction* I) {
-      return isSafeToSpeculativelyExecute(I) &&
-            !I->mayReadFromMemory() &&
-            !isa<LandingPadInst>(I);
-    }
+      // ------------------------------------------------------------------
+      // Figure 4 from assignment: invariant candidate check
+      // ------------------------------------------------------------------
+      static bool isInvariantCandidate(const Instruction* I) {
+          return isSafeToSpeculativelyExecute(I) &&
+                !I->mayReadFromMemory()          &&
+                !isa<LandingPadInst>(I);
+      }
 
-    // ------------------------------------------------------------
-    // Build Immediate Dominator Map
-    // ------------------------------------------------------------
-    static DenseMap<BasicBlock*, BasicBlock*>
-    buildIDomMap(Function& F) {
-      std::vector<BasicBlock*> vertex;
-      DenseMap<BasicBlock*, int> index;
-      std::vector<int> parent;
-      int N = 0;
+      // ------------------------------------------------------------------
+      // Check if all operands of I are loop-invariant:
+      //   - constants or function arguments: always invariant
+      //   - defined outside the loop: invariant
+      //   - defined inside the loop but already in invariants set: invariant
+      // ------------------------------------------------------------------
+      static bool isLoopInvariant(
+              const Instruction* I,
+              const SmallPtrSet<BasicBlock*, 8>& loopBlocks,
+              const SmallPtrSet<const Instruction*, 16>& invariants) {
 
-      std::function<void(BasicBlock*)> dfs = [&](BasicBlock* v) {
-        index[v] = N++;
-        vertex.push_back(v);
-        parent.push_back(-1);
-        for (auto* s : successors(v))
-          if (!index.count(s)) {
-            dfs(s);
-            parent[index[s]] = index[v];
+          if (!isInvariantCandidate(I)) return false;
+
+          for (const Value* Op : I->operands()) {
+              if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
+              if (const auto* opI = dyn_cast<Instruction>(Op)) {
+                  if (!loopBlocks.count(opI->getParent())) continue; // outside loop
+                  if (invariants.count(opI))               continue; // already proven
+              }
+              return false; // anything else: not invariant
           }
-      };
-      dfs(&F.getEntryBlock());
-
-      std::vector<int> semi(N), idom(N, -1), ancestor(N, -1), label(N);
-      std::vector<std::vector<int>> bucket(N);
-      for (int i = 0; i < N; ++i) {
-        semi[i] = i;
-        label[i] = i;
+          return true;
       }
 
-      std::function<void(int)> compress = [&](int v) {
-        if (ancestor[v] != -1 && ancestor[ancestor[v]] != -1) {
-          compress(ancestor[v]);
-          if (semi[label[ancestor[v]]] < semi[label[v]])
-            label[v] = label[ancestor[v]];
-          ancestor[v] = ancestor[ancestor[v]];
-        }
-      };
-
-      std::function<int(int)> eval = [&](int v) -> int {
-        if (ancestor[v] == -1) return label[v];
-        compress(v);
-        return label[v];
-      };
-
-      for (int w = N - 1; w > 0; --w) {
-        for (auto* pred : predecessors(vertex[w])) {
-          if (!index.count(pred)) continue;
-          int u = eval(index[pred]);
-          semi[w] = std::min(semi[w], semi[u]);
-        }
-        bucket[semi[w]].push_back(w);
-        ancestor[w] = parent[w];
-
-        for (int v : bucket[parent[w]]) {
-          int u = eval(v);
-          idom[v] = (semi[u] < semi[v]) ? u : parent[w];
-        }
-        bucket[parent[w]].clear();
-      }
-
-      for (int i = 1; i < N; ++i)
-        if (idom[i] != semi[i])
-          idom[i] = idom[idom[i]];
-
-      DenseMap<BasicBlock*, BasicBlock*> idomMap;
-      idomMap[vertex[0]] = nullptr;
-      for (int i = 1; i < N; ++i)
-        idomMap[vertex[i]] = vertex[idom[i]];
-
-      return idomMap;
-    }
-
-    // ------------------------------------------------------------
-    // Dominance check
-    // ------------------------------------------------------------
-    static bool dominates(
-        BasicBlock* A,
-        BasicBlock* B,
-        const DenseMap<BasicBlock*, BasicBlock*>& idomMap) {
-
-      if (A == B) return true;
-      BasicBlock* cur = B;
-
-      while (cur) {
-        auto it = idomMap.find(cur);
-        if (it == idomMap.end() || it->second == nullptr) break;
-        cur = it->second;
-        if (cur == A) return true;
-      }
-      return false;
-    }
-
-    // ------------------------------------------------------------
-    static SmallVector<BasicBlock*, 4>
-    getExitBlocks(const SmallVector<BasicBlock*, 8>& loopBlocks) {
-
-      SmallPtrSet<BasicBlock*, 8> inLoop(loopBlocks.begin(), loopBlocks.end());
-      SmallVector<BasicBlock*, 4> exits;
-
-      for (BasicBlock* BB : loopBlocks)
-        for (BasicBlock* succ : successors(BB))
-          if (!inLoop.count(succ))
-            exits.push_back(succ);
-
-      return exits;
-    }
-
-    // ------------------------------------------------------------
-    bool processLoop(
-        Function& F,
-        const SmallVector<BasicBlock*, 8>& loopBlocks,
-        BasicBlock* header,
-        BasicBlock* preheader,
-        const DenseMap<BasicBlock*, BasicBlock*>& idomMap) {
-
-      // (your logic unchanged — just keep it here)
-      // NOTE: I removed nothing, just ensured parameters exist
-
-      return false; // placeholder (keep your original return logic)
-    }
-
-    // ------------------------------------------------------------
-    static SmallVector<BasicBlock*, 8>
-    collectLoopBlocks(
-        BasicBlock* header,
-        const DenseMap<BasicBlock*, BasicBlock*>& idomMap) {
-
-      SmallVector<BasicBlock*, 8> result;
-      SmallPtrSet<BasicBlock*, 8> visited;
-
-      SmallVector<BasicBlock*, 4> backEdgeTails;
-      for (BasicBlock* pred : predecessors(header))
-        if (dominates(header, pred, idomMap))
-          backEdgeTails.push_back(pred);
-
-      if (backEdgeTails.empty()) return result;
-
-      SmallVector<BasicBlock*, 8> worklist;
-      visited.insert(header);
-      result.push_back(header);
-
-      for (BasicBlock* tail : backEdgeTails) {
-        if (!visited.count(tail)) {
-          visited.insert(tail);
-          result.push_back(tail);
-          worklist.push_back(tail);
-        }
-      }
-
-      while (!worklist.empty()) {
-        BasicBlock* bb = worklist.pop_back_val();
-        for (BasicBlock* pred : predecessors(bb)) {
-          if (!visited.count(pred)) {
-            visited.insert(pred);
-            result.push_back(pred);
-            worklist.push_back(pred);
+      // ------------------------------------------------------------------
+      // Fixed-point collection of all loop-invariant instructions
+      // ------------------------------------------------------------------
+      static SmallPtrSet<const Instruction*, 16>
+      collectInvariants(Loop* L, const SmallPtrSet<BasicBlock*, 8>& loopBlocks) {
+          SmallPtrSet<const Instruction*, 16> invariants;
+          bool changed = true;
+          while (changed) {
+              changed = false;
+              for (BasicBlock* BB : L->blocks()) {
+                  for (Instruction& I : *BB) {
+                      if (invariants.count(&I)) continue;
+                      if (isLoopInvariant(&I, loopBlocks, invariants)) {
+                          invariants.insert(&I);
+                          changed = true;
+                      }
+                  }
+              }
           }
-        }
+          return invariants;
       }
 
-      return result;
-    }
-
-    // ------------------------------------------------------------
-    static BasicBlock*
-    getPreheader(BasicBlock* header,
-                const SmallPtrSet<BasicBlock*, 8>& inLoop) {
-
-      BasicBlock* pre = nullptr;
-      for (BasicBlock* pred : predecessors(header)) {
-        if (!inLoop.count(pred)) {
-          if (pre) return nullptr;
-          pre = pred;
-        }
+      // ------------------------------------------------------------------
+      // Collect blocks outside the loop that are direct successors of
+      // blocks inside the loop (these are the loop exit blocks)
+      // ------------------------------------------------------------------
+      static SmallVector<BasicBlock*, 4>
+      getExitBlocks(Loop* L, const SmallPtrSet<BasicBlock*, 8>& loopBlocks) {
+          SmallVector<BasicBlock*, 4> exits;
+          SmallPtrSet<BasicBlock*, 4> seen;
+          for (BasicBlock* BB : L->blocks())
+              for (BasicBlock* succ : successors(BB))
+                  if (!loopBlocks.count(succ) && !seen.count(succ)) {
+                      exits.push_back(succ);
+                      seen.insert(succ);
+                  }
+          return exits;
       }
-      return pre;
-    }
 
-    // ------------------------------------------------------------
-    // MAIN ENTRY (ONLY ONE run FUNCTION!)
-    // ------------------------------------------------------------
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+      // ------------------------------------------------------------------
+      // Topological sort of instructions to hoist
+      // Ensures every def is placed before its uses in the target block
+      // ------------------------------------------------------------------
+      static SmallVector<Instruction*, 16>
+      topoSort(const SmallVector<Instruction*, 16>& candidates,
+              const SmallPtrSet<const Instruction*, 16>& invariantSet) {
 
-      errs() << "=== LICM Pass: " << F.getName() << " ===\n";
+          SmallPtrSet<Instruction*, 16> candSet(candidates.begin(), candidates.end());
+          SmallPtrSet<Instruction*, 16> emitted;
+          SmallVector<Instruction*, 16> ordered;
 
-      DenseMap<BasicBlock*, BasicBlock*> idomMap = buildIDomMap(F);
+          std::function<void(Instruction*)> emit = [&](Instruction* I) {
+              if (emitted.count(I)) return;
+              emitted.insert(I);
+              for (Value* Op : I->operands())
+                  if (auto* opI = dyn_cast<Instruction>(Op))
+                      if (candSet.count(opI))
+                          emit(opI);   // emit dependency first
+              ordered.push_back(I);
+          };
 
-      SmallVector<BasicBlock*, 8> headers;
-      for (BasicBlock& BB : F) {
-        for (BasicBlock* pred : predecessors(&BB)) {
-          if (dominates(&BB, pred, idomMap)) {
-            headers.push_back(&BB);
-            break;
+          for (Instruction* I : candidates) emit(I);
+          return ordered;
+      }
+
+      // ------------------------------------------------------------------
+      // Landing Pad Transformation (Assignment Section 7.4)
+      //
+      // BEFORE:                    AFTER:
+      //   preheader                  preheader
+      //       |                          |
+      //       v                          v
+      //    header <--\               testBlock ---> loopExit
+      //       |      |                   |
+      //    body   latch              landingPad
+      //       |      |                   |
+      //    loopExit  |                header <--\
+      //                                  |      |
+      //                               body   latch
+      //                                  |      |
+      //                               loopExit  |
+      //
+      // testBlock:   replicates header branch; skips loop if condition false
+      // landingPad:  unconditional; hoisted invariants live here;
+      //              only reached when loop will execute >= 1 time
+      // ------------------------------------------------------------------
+      static BasicBlock* insertLandingPad(
+              BasicBlock* header,
+              BasicBlock* preheader,
+              const SmallPtrSet<BasicBlock*, 8>& loopBlocks) {
+
+          BranchInst* headerBr = dyn_cast<BranchInst>(header->getTerminator());
+          if (!headerBr || !headerBr->isConditional()) return nullptr;
+
+          BasicBlock* loopExit = nullptr;
+          BasicBlock* loopBody = nullptr;
+          for (unsigned i = 0; i < headerBr->getNumSuccessors(); ++i) {
+              BasicBlock* succ = headerBr->getSuccessor(i);
+              if (!loopBlocks.count(succ)) loopExit = succ;
+              else                          loopBody  = succ;
           }
-        }
+          if (!loopExit || !loopBody) return nullptr;
+
+          LLVMContext& Ctx = header->getContext();
+          Function* F   = header->getParent();
+
+          // ---- Create blocks ----
+          BasicBlock* testBlock  = BasicBlock::Create(Ctx, "licm.test",       F, header);
+          BasicBlock* landingPad = BasicBlock::Create(Ctx, "licm.landingpad", F, header);
+
+          BranchInst::Create(header, landingPad);
+
+          // ------------------------------------------------------------------
+          // 1. Recursive cloner to evaluate header values inside testBlock
+          // This fixes the "%cmp used before defined" dominance error.
+          // ------------------------------------------------------------------
+          DenseMap<Value*, Value*> clonedVals;
+          std::function<Value*(Value*)> cloneForTestBlock = [&](Value* V) -> Value* {
+              if (clonedVals.count(V)) return clonedVals[V];
+
+              Instruction* I = dyn_cast<Instruction>(V);
+              // If it's not an instruction or outside header, it already dominates testBlock
+              if (!I || I->getParent() != header)
+                  return V;
+
+              // If it's a PHI, grab the initial value coming from preheader
+              if (PHINode* phi = dyn_cast<PHINode>(I)) {
+                  Value* inc = phi->getIncomingValueForBlock(preheader);
+                  clonedVals[V] = inc;
+                  return inc;
+              }
+
+              // Otherwise, recursively clone the instruction
+              Instruction* cInst = I->clone();
+              for (unsigned i = 0; i < cInst->getNumOperands(); ++i) {
+                  cInst->setOperand(i, cloneForTestBlock(cInst->getOperand(i)));
+              }
+              cInst->insertInto(testBlock, testBlock->end());
+              clonedVals[V] = cInst;
+              return cInst;
+          };
+
+          // Re-evaluate condition for testBlock
+          Value* cond     = headerBr->getCondition();
+          Value* testCond = cloneForTestBlock(cond);
+          bool bodyIsTrue = (headerBr->getSuccessor(0) == loopBody);
+
+          if (bodyIsTrue)
+              BranchInst::Create(landingPad, loopExit, testCond, testBlock);
+          else
+              BranchInst::Create(loopExit, landingPad, testCond, testBlock);
+
+          // ---- Redirect preheader ----
+          Instruction* preTerm = preheader->getTerminator();
+          for (unsigned i = 0; i < preTerm->getNumSuccessors(); ++i)
+              if (preTerm->getSuccessor(i) == header)
+                  preTerm->setSuccessor(i, testBlock);
+
+          // ---- Fix header PHIs ----
+          for (PHINode& phi : header->phis()) {
+              int idx = phi.getBasicBlockIndex(preheader);
+              if (idx >= 0)
+                  phi.setIncomingBlock(idx, landingPad);
+          }
+
+          // ---- Fix existing loopExit PHIs ----
+          for (PHINode& phi : loopExit->phis()) {
+              int idx = phi.getBasicBlockIndex(header);
+              if (idx >= 0) {
+                  Value* incoming = phi.getIncomingValue(idx);
+                  phi.addIncoming(cloneForTestBlock(incoming), testBlock);
+              }
+          }
+
+          // ------------------------------------------------------------------
+          // 2. Fix direct external uses of header definitions
+          // This fixes the "%p.0 used before defined" dominance error.
+          // ------------------------------------------------------------------
+          SmallVector<Instruction*, 8> headerInsts;
+          for (Instruction& I : *header) headerInsts.push_back(&I);
+
+          for (Instruction* I : headerInsts) {
+              SmallVector<Use*, 8> externalUses;
+              for (Use& U : I->uses()) {
+                  Instruction* user = cast<Instruction>(U.getUser());
+                  // If the use is outside the loop
+                  if (!loopBlocks.count(user->getParent())) {
+                      // Skip if it's already an operand of a PHI in loopExit we just handled
+                      if (PHINode* userPhi = dyn_cast<PHINode>(user)) {
+                          if (userPhi->getParent() == loopExit) continue;
+                      }
+                      externalUses.push_back(&U);
+                  }
+              }
+
+              if (!externalUses.empty()) {
+                  // Insert a new LCSSA PHI node to safely merge the values
+                  PHINode* exitPhi = PHINode::Create(I->getType(), 2, I->getName() + ".lcssa", loopExit->getFirstNonPHIIt());
+                  exitPhi->addIncoming(I, header);
+                  exitPhi->addIncoming(cloneForTestBlock(I), testBlock);
+
+                  for (Use* U : externalUses) {
+                      U->set(exitPhi);
+                  }
+              }
+          }
+
+          errs() << "  Landing pad inserted: "
+                 << testBlock->getName()  << " -> "
+                 << landingPad->getName() << " -> "
+                 << header->getName()     << "\n";
+
+          return landingPad;
+      }
+      // ------------------------------------------------------------------
+      // Process one loop
+      // ------------------------------------------------------------------
+      static bool processLoop(Loop* L, const DominatorAnalysis::Result& DR) {
+
+          BasicBlock* header    = L->getHeader();
+          BasicBlock* preheader = L->getLoopPreheader();
+
+          // Assignment: skip loops with no preheader
+          if (!preheader) {
+              errs() << "  Skipping (no preheader): "
+                    << getShortValueName(header) << "\n";
+              return false;
+          }
+
+          // Build loop block set
+          SmallPtrSet<BasicBlock*, 8> loopBlocks;
+          for (BasicBlock* BB : L->blocks()) loopBlocks.insert(BB);
+
+          SmallVector<BasicBlock*, 4> exitBlocks = getExitBlocks(L, loopBlocks);
+
+          // ---- Collect invariants ----
+          SmallPtrSet<const Instruction*, 16> invariants =
+              collectInvariants(L, loopBlocks);
+
+          if (invariants.empty()) return false;
+
+          errs() << "  Header: " << getShortValueName(header)
+                << "  Invariants found: " << invariants.size() << "\n";
+
+          // ---- Partition: dominates all exits vs does not ----
+          SmallVector<Instruction*, 16> toPreheader;
+          SmallVector<Instruction*, 16> toLandingPad;
+
+          for (BasicBlock* BB : L->blocks()) {
+              for (Instruction& I : *BB) {
+                  if (!invariants.count(&I)) continue;
+
+                  bool domAllExits = true;
+                  for (BasicBlock* exit : exitBlocks)
+                      if (!DominatorAnalysis::dominates(BB, exit, DR)) {
+                          domAllExits = false;
+                          break;
+                      }
+
+                  if (domAllExits) toPreheader.push_back(&I);
+                  else             toLandingPad.push_back(&I);
+              }
+          }
+
+          bool anyHoisted = false;
+
+          // ---- Hoist group A -> preheader ----
+          if (!toPreheader.empty()) {
+              Instruction* insertPt = preheader->getTerminator();
+              for (Instruction* I : topoSort(toPreheader, invariants)) {
+                  errs() << "  Hoist to preheader: " << *I << "\n";
+                  I->moveBefore(insertPt->getIterator());
+                  anyHoisted = true;
+              }
+          }
+
+          // ---- Hoist group B -> landing pad ----
+          if (!toLandingPad.empty()) {
+              BasicBlock* lp = insertLandingPad(header, preheader, loopBlocks);
+              if (lp) {
+                  Instruction* insertPt = lp->getTerminator();
+                  for (Instruction* I : topoSort(toLandingPad, invariants)) {
+                      errs() << "  Hoist to landing pad: " << *I << "\n";
+                      I->moveBefore(insertPt->getIterator());
+                      anyHoisted = true;
+                  }
+              }
+          }
+
+          return anyHoisted;
       }
 
-      if (headers.empty())
-        return PreservedAnalyses::all();
+      // ------------------------------------------------------------------
+      // Main entry point
+      // ------------------------------------------------------------------
+      PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+          errs() << "=== LICM: " << F.getName() << " ===\n";
 
-      bool anyChange = false;
+          auto& LI = FAM.getResult<LoopAnalysis>(F);
 
-      for (BasicBlock* header : llvm::reverse(headers)) {
+          // Compute dominators using your pass
+          DominatorAnalysis::Result DR = DominatorAnalysis::computeDominators(F);
 
-        SmallVector<BasicBlock*, 8> loopBlocks =
-            collectLoopBlocks(header, idomMap);
+          bool anyChange = false;
 
-        if (loopBlocks.empty()) continue;
+          for (Loop* L : LI) {
+              // Process innermost loops first so invariants bubble outward
+              for (Loop* sub : L->getSubLoops()) {
+                  DominatorAnalysis::Result subDR =
+                      anyChange ? DominatorAnalysis::computeDominators(F) : DR;
+                  anyChange |= processLoop(sub, subDR);
+              }
 
-        SmallPtrSet<BasicBlock*, 8> inLoop(loopBlocks.begin(), loopBlocks.end());
-        BasicBlock* preheader = getPreheader(header, inLoop);
+              DominatorAnalysis::Result outerDR =
+                  anyChange ? DominatorAnalysis::computeDominators(F) : DR;
+              anyChange |= processLoop(L, outerDR);
+          }
 
-        if (!preheader) continue;
-
-        if (anyChange)
-          idomMap = buildIDomMap(F);
-
-        bool changed = processLoop(F, loopBlocks, header, preheader, idomMap);
-        anyChange |= changed;
+          return anyChange ? PreservedAnalyses::none()
+                          : PreservedAnalyses::all();
       }
-
-      return anyChange ? PreservedAnalyses::none()
-                      : PreservedAnalyses::all();
-    }
   };
+
+
+
 } //namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
