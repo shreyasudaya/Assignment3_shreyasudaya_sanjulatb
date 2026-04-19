@@ -46,133 +46,101 @@ namespace {
   }
 
   
-  struct DominatorAnalysis : PassInfoMixin<DominatorAnalysis> {
+  struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
+    PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
 
-    // ------------------------------------------------------------------
-    // All dominator state needed by LICM, returned as a plain struct
-    // so LICM can call computeDominators() without running a pass
-    // ------------------------------------------------------------------
-    struct Result {
-        std::vector<BasicBlock*>   vertex;   // vertex[i] = BB at DFS index i
-        DenseMap<BasicBlock*, int> index;    // BB -> DFS index
-        std::vector<int>           idom;     // idom[i] = DFS index of idom(i)
-    };
+      //DFS NUMBERING
+      std::vector<BasicBlock*> vertex;
+      DenseMap<BasicBlock*, int> index;
 
-    // ------------------------------------------------------------------
-    // Your Lengauer-Tarjan implementation, refactored into a static
-    // function so LICMPass can call it directly
-    // ------------------------------------------------------------------
-    static Result computeDominators(Function& F) {
-        Result R;
-        std::vector<int> parent;
-        int N = 0;
+      std::vector<int> parent;
+      int N = 0;
 
-        // ---- DFS numbering (fixed: pass parent explicitly) ----
-        std::function<void(BasicBlock*, int)> dfs = [&](BasicBlock* v, int par) {
-            R.index[v] = N++;
-            R.vertex.push_back(v);
-            parent.push_back(par);
-            for (BasicBlock* succ : successors(v))
-                if (!R.index.count(succ))
-                    dfs(succ, R.index[v]);
-        };
-        dfs(&F.getEntryBlock(), -1);
+      std::function<void(BasicBlock*)> dfs = [&](BasicBlock* v) {
+        index[v] = N++;
+        vertex.push_back(v);
+        parent.push_back(-1);
 
-        // ---- Initialize arrays ----
-        std::vector<int> semi(N), idom(N, -1), ancestor(N, -1), label(N);
-        std::vector<std::vector<int>> bucket(N);
-        for (int i = 0; i < N; ++i) { semi[i] = i; label[i] = i; }
+        for (auto* succ : successors(v)) {
+          if (!index.count(succ)) {
+            parent.push_back(index[v]); 
+            dfs(succ);
+            parent[index[succ]] = index[v];
+          }
+        }
+      };
 
-        // ---- Path compression (your compress, fixed guard) ----
-        std::function<void(int)> compress = [&](int v) {
-            if (ancestor[v] != -1 && ancestor[ancestor[v]] != -1) {
-                compress(ancestor[v]);
-                if (semi[label[ancestor[v]]] < semi[label[v]])
-                    label[v] = label[ancestor[v]];
-                ancestor[v] = ancestor[ancestor[v]];
-            }
-        };
+      BasicBlock* entry = &F.getEntryBlock();
+      dfs(entry);
 
-        auto eval = [&](int v) -> int {
-            if (ancestor[v] == -1) return label[v];
-            compress(v);
-            return label[v];
-        };
+      // Resize arrays
+      std::vector<int> semi(N), idom(N, -1), ancestor(N, -1), label(N);
+      std::vector<std::vector<int>> bucket(N);
 
-        // ---- Lengauer-Tarjan main loop (your logic, unchanged) ----
-        for (int w = N - 1; w > 0; --w) {
-            BasicBlock* BB = R.vertex[w];
+      for (int i = 0; i < N; ++i) {
+        semi[i] = i;
+        label[i] = i;
+      }
 
-            // Compute semidominator
-            for (BasicBlock* pred : predecessors(BB)) {
-                if (!R.index.count(pred)) continue;
-                int v = R.index[pred];
-                int u = eval(v);
-                semi[w] = std::min(semi[w], semi[u]);
-            }
+      //Union helpers
+      std::function<void(int)> compress = [&](int v) {
+        if (ancestor[ancestor[v]] != -1) {
+          compress(ancestor[v]);
+          if (semi[label[ancestor[v]]] < semi[label[v]])
+            label[v] = label[ancestor[v]];
+          ancestor[v] = ancestor[ancestor[v]];
+        }
+      };
 
-            bucket[semi[w]].push_back(w);
-            ancestor[w] = parent[w];   // link(parent[w], w)
+      std::function<int(int)> eval = [&](int v) -> int {
+        if (ancestor[v] == -1)
+          return label[v];
+        compress(v);
+        return label[v];
+      };
 
-            // Process bucket
-            for (int v : bucket[parent[w]]) {
-                int u = eval(v);
-                idom[v] = (semi[u] < semi[v]) ? u : parent[w];
-            }
-            bucket[parent[w]].clear();
+      auto link = [&](int v, int w) {
+        ancestor[w] = v;
+      };
+
+      //Lengar-Tarjan Algorithm
+      for (int w = N - 1; w > 0; --w) {
+        BasicBlock* BB = vertex[w];
+
+        //Compute semi-dominator
+        for (auto* pred : predecessors(BB)) {
+          if (!index.count(pred)) continue;
+          int v = index[pred];
+          int u = eval(v);
+          semi[w] = std::min(semi[w], semi[u]);
         }
 
-        // Finalize (your logic, unchanged)
-        for (int i = 1; i < N; ++i)
-            if (idom[i] != semi[i])
-                idom[i] = idom[idom[i]];
+        bucket[semi[w]].push_back(w);
+        link(parent[w], w);
 
-        R.idom = idom;
-        return R;
-    }
-
-    // ------------------------------------------------------------------
-    // dominates(): walks idom chain from B upward looking for A
-    // ------------------------------------------------------------------
-    static bool dominates(BasicBlock* A, BasicBlock* B, const Result& R) {
-        if (A == B) return true;
-        auto it = R.index.find(B);
-        if (it == R.index.end()) return false;
-        int cur = it->second;
-        while (cur > 0) {
-            cur = R.idom[cur];
-            if (cur < 0) break;
-            if (R.vertex[cur] == A) return true;
+        //Process Bucket
+        for (int v : bucket[parent[w]]) {
+          int u = eval(v);
+          if (semi[u] < semi[v])
+            idom[v] = u;
+          else
+            idom[v] = parent[w];
         }
-        return false;
-    }
+      }
 
-    // ------------------------------------------------------------------
-    // Pass entry point: prints idom for each block (your original output)
-    // ------------------------------------------------------------------
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
-        auto& LI = FAM.getResult<LoopAnalysis>(F);
-        Result R  = computeDominators(F);
+      //Finalize idominators
+      for (int i = 1; i < N; ++i) {
+        if (idom[i] != semi[i])
+          idom[i] = idom[idom[i]];
+      }
 
-        errs() << "=== Dominators: " << F.getName() << " ===\n";
+      for (int i = 1; i < N; ++i) {
+        errs() << "Block " << getShortValueName(vertex[i])
+              << " is dominated by "
+              << getShortValueName(vertex[idom[i]]) << "\n";
+      }
 
-        for (Loop* L : LI) {
-            errs() << "Loop header: " << getShortValueName(L->getHeader()) << "\n";
-            for (BasicBlock* BB : L->blocks()) {
-                auto it = R.index.find(BB);
-                if (it == R.index.end()) continue;
-                int idx = it->second;
-                if (idx == 0) {
-                    errs() << "  " << getShortValueName(BB) << " idom: (entry)\n";
-                    continue;
-                }
-                BasicBlock* idomBB = R.vertex[R.idom[idx]];
-                errs() << "  " << getShortValueName(BB)
-                       << " idom: " << getShortValueName(idomBB) << "\n";
-            }
-        }
-
-        return PreservedAnalyses::all();
+      return PreservedAnalyses::all();
     }
   };
 
