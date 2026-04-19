@@ -173,7 +173,7 @@ namespace {
 
         return PreservedAnalyses::all();
     }
-};
+  };
 
   struct DCEPass : PassInfoMixin<DCEPass> {
     //Liveness conditions
@@ -307,370 +307,82 @@ namespace {
     }
   };
 
+  // Checks if the instruction is safe to hoist out of the loop
+  bool isSafeToHoist(Instruction *I) {
+      return isSafeToSpeculativelyExecute(I) && 
+            !I->mayReadFromMemory() && 
+            !isa<LandingPadInst>(I);
+  }
 
-  // ============================================================================
-  // LICM PASS
-  // ============================================================================
-  struct LICMPass : PassInfoMixin<LICMPass> {
+  // Checks if all operands of an instruction are loop-invariant
+  bool hasLoopInvariantOperands(Instruction *I, Loop *L, const std::set<Instruction*> &InvariantSet) {
+      for (Use &U : I->operands()) {
+          Value *V = U.get();
+          
+          // Constants and Arguments are always loop-invariant
+          if (isa<Constant>(V) || isa<Argument>(V)) {
+              continue;
+          }
+          
+          if (Instruction *OpInst = dyn_cast<Instruction>(V)) {
+              // If the operand is an instruction defined OUTSIDE the loop, it's invariant
+              if (!L->contains(OpInst)) {
+                  continue;
+              }
+              // If it's defined INSIDE the loop, it must already be in our InvariantSet
+              if (InvariantSet.count(OpInst)) {
+                  continue;
+              }
+          }
+          
+          // If we reach here, at least one operand is modified inside the loop and not invariant
+          return false;
+      }
+      return true; // All operands passed the checks
+  }
 
-      // ------------------------------------------------------------------
-      // Figure 4 from assignment: invariant candidate check
-      // ------------------------------------------------------------------
-      static bool isInvariantCandidate(const Instruction* I) {
-          return isSafeToSpeculativelyExecute(I) &&
-                !I->mayReadFromMemory()          &&
-                !isa<LandingPadInst>(I);
+  struct MyLoopOperandAnalysis : PassInfoMixin<MyLoopOperandAnalysis> {
+    PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
+                          LoopStandardAnalysisResults &AR, LPMUpdater &U) {
+      
+      errs() << "\n--- Analyzing Loop Header: " << L.getHeader()->getName() << " ---\n";
+
+      // 1. Iterate over every Basic Block assigned to this loop
+      for (BasicBlock *BB : L.getBlocks()) {
+        errs() << "  Block: " << BB->getName() << "\n";
+
+        // 2. Iterate over every Instruction in the block
+        for (Instruction &I : *BB) {
+          errs() << "    Instruction: " << I << "\n";
+
+          // 3. Check each Operand (Use) of the instruction
+          for (Value *Op : I.operands()) {
+            
+            // We only care about operands defined by other instructions
+            // (Ignores Constants, Function Arguments, and Inline Assembly)
+            if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+              
+              errs() << "      Operand: ";
+              OpInst->printAsOperand(errs(), false);
+
+              // 4. Use Loop::contains to check if the definition is inside the loop
+              if (L.contains(OpInst->getParent())) {
+                errs() << " [Defined INSIDE loop]\n";
+              } else {
+                errs() << " [Defined OUTSIDE loop (Invariant/External)]\n";
+              }
+            } else if (isa<Argument>(Op)) {
+              errs() << "      Operand: ";
+              Op->printAsOperand(errs(), false);
+              errs() << " [Defined OUTSIDE loop (Function Argument)]\n";
+            }
+          }
+        }
       }
 
-      // ------------------------------------------------------------------
-      // Check if all operands of I are loop-invariant:
-      //   - constants or function arguments: always invariant
-      //   - defined outside the loop: invariant
-      //   - defined inside the loop but already in invariants set: invariant
-      // ------------------------------------------------------------------
-      static bool isLoopInvariant(
-              const Instruction* I,
-              const SmallPtrSet<BasicBlock*, 8>& loopBlocks,
-              const SmallPtrSet<const Instruction*, 16>& invariants) {
-
-          if (!isInvariantCandidate(I)) return false;
-
-          for (const Value* Op : I->operands()) {
-              if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
-              if (const auto* opI = dyn_cast<Instruction>(Op)) {
-                  if (!loopBlocks.count(opI->getParent())) continue; // outside loop
-                  if (invariants.count(opI))               continue; // already proven
-              }
-              return false; // anything else: not invariant
-          }
-          return true;
-      }
-
-      // ------------------------------------------------------------------
-      // Fixed-point collection of all loop-invariant instructions
-      // ------------------------------------------------------------------
-      static SmallPtrSet<const Instruction*, 16>
-      collectInvariants(Loop* L, const SmallPtrSet<BasicBlock*, 8>& loopBlocks) {
-          SmallPtrSet<const Instruction*, 16> invariants;
-          bool changed = true;
-          while (changed) {
-              changed = false;
-              for (BasicBlock* BB : L->blocks()) {
-                  for (Instruction& I : *BB) {
-                      if (invariants.count(&I)) continue;
-                      if (isLoopInvariant(&I, loopBlocks, invariants)) {
-                          invariants.insert(&I);
-                          changed = true;
-                      }
-                  }
-              }
-          }
-          return invariants;
-      }
-
-      // ------------------------------------------------------------------
-      // Collect blocks outside the loop that are direct successors of
-      // blocks inside the loop (these are the loop exit blocks)
-      // ------------------------------------------------------------------
-      static SmallVector<BasicBlock*, 4>
-      getExitBlocks(Loop* L, const SmallPtrSet<BasicBlock*, 8>& loopBlocks) {
-          SmallVector<BasicBlock*, 4> exits;
-          SmallPtrSet<BasicBlock*, 4> seen;
-          for (BasicBlock* BB : L->blocks())
-              for (BasicBlock* succ : successors(BB))
-                  if (!loopBlocks.count(succ) && !seen.count(succ)) {
-                      exits.push_back(succ);
-                      seen.insert(succ);
-                  }
-          return exits;
-      }
-
-      // ------------------------------------------------------------------
-      // Topological sort of instructions to hoist
-      // Ensures every def is placed before its uses in the target block
-      // ------------------------------------------------------------------
-      static SmallVector<Instruction*, 16>
-      topoSort(const SmallVector<Instruction*, 16>& candidates,
-              const SmallPtrSet<const Instruction*, 16>& invariantSet) {
-
-          SmallPtrSet<Instruction*, 16> candSet(candidates.begin(), candidates.end());
-          SmallPtrSet<Instruction*, 16> emitted;
-          SmallVector<Instruction*, 16> ordered;
-
-          std::function<void(Instruction*)> emit = [&](Instruction* I) {
-              if (emitted.count(I)) return;
-              emitted.insert(I);
-              for (Value* Op : I->operands())
-                  if (auto* opI = dyn_cast<Instruction>(Op))
-                      if (candSet.count(opI))
-                          emit(opI);   // emit dependency first
-              ordered.push_back(I);
-          };
-
-          for (Instruction* I : candidates) emit(I);
-          return ordered;
-      }
-
-      // ------------------------------------------------------------------
-      // Landing Pad Transformation (Assignment Section 7.4)
-      //
-      // BEFORE:                    AFTER:
-      //   preheader                  preheader
-      //       |                          |
-      //       v                          v
-      //    header <--\               testBlock ---> loopExit
-      //       |      |                   |
-      //    body   latch              landingPad
-      //       |      |                   |
-      //    loopExit  |                header <--\
-      //                                  |      |
-      //                               body   latch
-      //                                  |      |
-      //                               loopExit  |
-      //
-      // testBlock:   replicates header branch; skips loop if condition false
-      // landingPad:  unconditional; hoisted invariants live here;
-      //              only reached when loop will execute >= 1 time
-      // ------------------------------------------------------------------
-      static BasicBlock* insertLandingPad(
-              BasicBlock* header,
-              BasicBlock* preheader,
-              const SmallPtrSet<BasicBlock*, 8>& loopBlocks) {
-
-          BranchInst* headerBr = dyn_cast<BranchInst>(header->getTerminator());
-          if (!headerBr || !headerBr->isConditional()) return nullptr;
-
-          BasicBlock* loopExit = nullptr;
-          BasicBlock* loopBody = nullptr;
-          for (unsigned i = 0; i < headerBr->getNumSuccessors(); ++i) {
-              BasicBlock* succ = headerBr->getSuccessor(i);
-              if (!loopBlocks.count(succ)) loopExit = succ;
-              else                          loopBody  = succ;
-          }
-          if (!loopExit || !loopBody) return nullptr;
-
-          LLVMContext& Ctx = header->getContext();
-          Function* F   = header->getParent();
-
-          // ---- Create blocks ----
-          BasicBlock* testBlock  = BasicBlock::Create(Ctx, "licm.test",       F, header);
-          BasicBlock* landingPad = BasicBlock::Create(Ctx, "licm.landingpad", F, header);
-
-          BranchInst::Create(header, landingPad);
-
-          // ------------------------------------------------------------------
-          // 1. Recursive cloner to evaluate header values inside testBlock
-          // This fixes the "%cmp used before defined" dominance error.
-          // ------------------------------------------------------------------
-          DenseMap<Value*, Value*> clonedVals;
-          std::function<Value*(Value*)> cloneForTestBlock = [&](Value* V) -> Value* {
-              if (clonedVals.count(V)) return clonedVals[V];
-
-              Instruction* I = dyn_cast<Instruction>(V);
-              // If it's not an instruction or outside header, it already dominates testBlock
-              if (!I || I->getParent() != header)
-                  return V;
-
-              // If it's a PHI, grab the initial value coming from preheader
-              if (PHINode* phi = dyn_cast<PHINode>(I)) {
-                  Value* inc = phi->getIncomingValueForBlock(preheader);
-                  clonedVals[V] = inc;
-                  return inc;
-              }
-
-              // Otherwise, recursively clone the instruction
-              Instruction* cInst = I->clone();
-              for (unsigned i = 0; i < cInst->getNumOperands(); ++i) {
-                  cInst->setOperand(i, cloneForTestBlock(cInst->getOperand(i)));
-              }
-              cInst->insertInto(testBlock, testBlock->end());
-              clonedVals[V] = cInst;
-              return cInst;
-          };
-
-          // Re-evaluate condition for testBlock
-          Value* cond     = headerBr->getCondition();
-          Value* testCond = cloneForTestBlock(cond);
-          bool bodyIsTrue = (headerBr->getSuccessor(0) == loopBody);
-
-          if (bodyIsTrue)
-              BranchInst::Create(landingPad, loopExit, testCond, testBlock);
-          else
-              BranchInst::Create(loopExit, landingPad, testCond, testBlock);
-
-          // ---- Redirect preheader ----
-          Instruction* preTerm = preheader->getTerminator();
-          for (unsigned i = 0; i < preTerm->getNumSuccessors(); ++i)
-              if (preTerm->getSuccessor(i) == header)
-                  preTerm->setSuccessor(i, testBlock);
-
-          // ---- Fix header PHIs ----
-          for (PHINode& phi : header->phis()) {
-              int idx = phi.getBasicBlockIndex(preheader);
-              if (idx >= 0)
-                  phi.setIncomingBlock(idx, landingPad);
-          }
-
-          // ---- Fix existing loopExit PHIs ----
-          for (PHINode& phi : loopExit->phis()) {
-              int idx = phi.getBasicBlockIndex(header);
-              if (idx >= 0) {
-                  Value* incoming = phi.getIncomingValue(idx);
-                  phi.addIncoming(cloneForTestBlock(incoming), testBlock);
-              }
-          }
-
-          // ------------------------------------------------------------------
-          // 2. Fix direct external uses of header definitions
-          // This fixes the "%p.0 used before defined" dominance error.
-          // ------------------------------------------------------------------
-          SmallVector<Instruction*, 8> headerInsts;
-          for (Instruction& I : *header) headerInsts.push_back(&I);
-
-          for (Instruction* I : headerInsts) {
-              SmallVector<Use*, 8> externalUses;
-              for (Use& U : I->uses()) {
-                  Instruction* user = cast<Instruction>(U.getUser());
-                  // If the use is outside the loop
-                  if (!loopBlocks.count(user->getParent())) {
-                      // Skip if it's already an operand of a PHI in loopExit we just handled
-                      if (PHINode* userPhi = dyn_cast<PHINode>(user)) {
-                          if (userPhi->getParent() == loopExit) continue;
-                      }
-                      externalUses.push_back(&U);
-                  }
-              }
-
-              if (!externalUses.empty()) {
-                  // Insert a new LCSSA PHI node to safely merge the values
-                  PHINode* exitPhi = PHINode::Create(I->getType(), 2, I->getName() + ".lcssa", loopExit->getFirstNonPHIIt());
-                  exitPhi->addIncoming(I, header);
-                  exitPhi->addIncoming(cloneForTestBlock(I), testBlock);
-
-                  for (Use* U : externalUses) {
-                      U->set(exitPhi);
-                  }
-              }
-          }
-
-          errs() << "  Landing pad inserted: "
-                 << testBlock->getName()  << " -> "
-                 << landingPad->getName() << " -> "
-                 << header->getName()     << "\n";
-
-          return landingPad;
-      }
-      // ------------------------------------------------------------------
-      // Process one loop
-      // ------------------------------------------------------------------
-      static bool processLoop(Loop* L, const DominatorAnalysis::Result& DR) {
-
-          BasicBlock* header    = L->getHeader();
-          BasicBlock* preheader = L->getLoopPreheader();
-
-          // Assignment: skip loops with no preheader
-          if (!preheader) {
-              errs() << "  Skipping (no preheader): "
-                    << getShortValueName(header) << "\n";
-              return false;
-          }
-
-          // Build loop block set
-          SmallPtrSet<BasicBlock*, 8> loopBlocks;
-          for (BasicBlock* BB : L->blocks()) loopBlocks.insert(BB);
-
-          SmallVector<BasicBlock*, 4> exitBlocks = getExitBlocks(L, loopBlocks);
-
-          // ---- Collect invariants ----
-          SmallPtrSet<const Instruction*, 16> invariants =
-              collectInvariants(L, loopBlocks);
-
-          if (invariants.empty()) return false;
-
-          errs() << "  Header: " << getShortValueName(header)
-                << "  Invariants found: " << invariants.size() << "\n";
-
-          // ---- Partition: dominates all exits vs does not ----
-          SmallVector<Instruction*, 16> toPreheader;
-          SmallVector<Instruction*, 16> toLandingPad;
-
-          for (BasicBlock* BB : L->blocks()) {
-              for (Instruction& I : *BB) {
-                  if (!invariants.count(&I)) continue;
-
-                  bool domAllExits = true;
-                  for (BasicBlock* exit : exitBlocks)
-                      if (!DominatorAnalysis::dominates(BB, exit, DR)) {
-                          domAllExits = false;
-                          break;
-                      }
-
-                  if (domAllExits) toPreheader.push_back(&I);
-                  else             toLandingPad.push_back(&I);
-              }
-          }
-
-          bool anyHoisted = false;
-
-          // ---- Hoist group A -> preheader ----
-          if (!toPreheader.empty()) {
-              Instruction* insertPt = preheader->getTerminator();
-              for (Instruction* I : topoSort(toPreheader, invariants)) {
-                  errs() << "  Hoist to preheader: " << *I << "\n";
-                  I->moveBefore(insertPt->getIterator());
-                  anyHoisted = true;
-              }
-          }
-
-          // ---- Hoist group B -> landing pad ----
-          if (!toLandingPad.empty()) {
-              BasicBlock* lp = insertLandingPad(header, preheader, loopBlocks);
-              if (lp) {
-                  Instruction* insertPt = lp->getTerminator();
-                  for (Instruction* I : topoSort(toLandingPad, invariants)) {
-                      errs() << "  Hoist to landing pad: " << *I << "\n";
-                      I->moveBefore(insertPt->getIterator());
-                      anyHoisted = true;
-                  }
-              }
-          }
-
-          return anyHoisted;
-      }
-
-      // ------------------------------------------------------------------
-      // Main entry point
-      // ------------------------------------------------------------------
-      PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
-          errs() << "=== LICM: " << F.getName() << " ===\n";
-
-          auto& LI = FAM.getResult<LoopAnalysis>(F);
-
-          // Compute dominators using your pass
-          DominatorAnalysis::Result DR = DominatorAnalysis::computeDominators(F);
-
-          bool anyChange = false;
-
-          for (Loop* L : LI) {
-              // Process innermost loops first so invariants bubble outward
-              for (Loop* sub : L->getSubLoops()) {
-                  DominatorAnalysis::Result subDR =
-                      anyChange ? DominatorAnalysis::computeDominators(F) : DR;
-                  anyChange |= processLoop(sub, subDR);
-              }
-
-              DominatorAnalysis::Result outerDR =
-                  anyChange ? DominatorAnalysis::computeDominators(F) : DR;
-              anyChange |= processLoop(L, outerDR);
-          }
-
-          return anyChange ? PreservedAnalyses::none()
-                          : PreservedAnalyses::all();
-      }
+      return PreservedAnalyses::all();
+    }
   };
-
-
-
 } //namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
@@ -688,7 +400,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
             return true;
           }
           else if (Name == "loop-invariant-code-motion") {
-            FPM.addPass(LICMPass());
+            FPM.addPass(createFunctionToLoopPassAdaptor(MyLoopOperandAnalysis()));
             return true;
           }
           return false;
