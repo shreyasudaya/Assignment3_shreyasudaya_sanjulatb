@@ -453,9 +453,13 @@ namespace {
           // TWEAK: Pass HoistedSet to check if operands are "effectively" invariant
           if (isInstructionInvariant(*I, L, HoistedSet)) {
               
+              MyDomTree DT;
+              DT.build(*F);
+
               bool dominatesAllExits = true;
+              BasicBlock *InstBB = I->getParent();
               for (BasicBlock *EB : ExitingBlocks) {
-                  if (!AR.DT.dominates(I, EB->getTerminator())) {
+                  if (!DT.dominates(InstBB, EB)) {
                       dominatesAllExits = false;
                       break;
                   }
