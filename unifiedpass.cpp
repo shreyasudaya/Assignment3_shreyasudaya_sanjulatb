@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "llvm/IR/Dominators.h"
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
@@ -341,52 +342,57 @@ namespace {
       return true; // All operands passed the checks
   }
 
-  struct MyInvariantAnalysis : PassInfoMixin<MyInvariantAnalysis> {
-  
-    // Helper to determine if a specific instruction is loop-invariant
+  struct MyLICMSafetyPass : PassInfoMixin<MyLICMSafetyPass> {
+    // Logic from before to check if operands are outside the loop
     bool isInstructionInvariant(Instruction &I, Loop &L) {
-      // A void instruction (like a store or call) usually shouldn't be 
-      // marked invariant based purely on operands.
-      if (I.getType()->isVoidTy()) return false;
-
+      if (I.getType()->isVoidTy() || I.isTerminator()) return false;
       for (Value *Op : I.operands()) {
-        // 1. If it's a Constant, it's invariant.
-        if (isa<Constant>(Op)) continue;
-
-        // 2. If it's a Function Argument, it's invariant.
-        if (isa<Argument>(Op)) continue;
-
-        // 3. If it's an Instruction, check its location.
+        if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
         if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
-          if (L.contains(OpInst->getParent())) {
-            // If even one operand is defined inside, the whole instruction is NOT invariant.
-            return false;
-          }
+          if (L.contains(OpInst->getParent())) return false;
           continue;
         }
-
-        // If we encounter something else (like inline asm), assume not invariant.
         return false;
       }
-
       return true;
     }
 
     PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
                           LoopStandardAnalysisResults &AR, LPMUpdater &U) {
       
-      errs() << "\n--- Checking Invariance in Loop: " << L.getHeader()->getName() << " ---\n";
+      DominatorTree &DT = AR.DT;
+      errs() << "\n--- Analyzing Loop: " << L.getHeader()->getName() << " ---\n";
 
+      // 1. Get and print all Exit Blocks
+      SmallVector<BasicBlock *, 4> ExitingBlocks;
+      L.getExitingBlocks(ExitingBlocks);
+      
+      errs() << "  Exiting Blocks: ";
+      for (BasicBlock *EB : ExitingBlocks) {
+        errs() << EB->getName() << " ";
+      }
+      errs() << "\n";
+
+      // 2. Iterate through blocks and instructions
       for (BasicBlock *BB : L.getBlocks()) {
         for (Instruction &I : *BB) {
           
           if (isInstructionInvariant(I, L)) {
-            errs() << "  [INVARIANT] ";
-            errs() << I << "\n";
-          } else {
-            // Optional: Print why it's variant if it's not a terminator/void
-            if (!I.getType()->isVoidTy() && !I.isTerminator()) {
-              // errs() << "  [VARIANT]   " << I << "\n";
+            errs() << "  Found Invariant: " << I << "\n";
+
+            // 3. Check if the instruction's block dominates ALL exiting blocks
+            bool dominatesAllExits = true;
+            for (BasicBlock *EB : ExitingBlocks) {
+              if (!DT.dominates(BB, EB)) {
+                dominatesAllExits = false;
+                break;
+              }
+            }
+
+            if (dominatesAllExits) {
+              errs() << "    [SAFE] Dominates all exiting blocks. Can be hoisted.\n";
+            } else {
+              errs() << "    [UNSAFE] Does not dominate all exiting blocks. Hoisting might change program behavior.\n";
             }
           }
         }
@@ -412,7 +418,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
             return true;
           }
           else if (Name == "loop-invariant-code-motion") {
-            FPM.addPass(createFunctionToLoopPassAdaptor(MyInvariantAnalysis()));
+            FPM.addPass(createFunctionToLoopPassAdaptor(MyLICMSafetyPass()));
             return true;
           }
           return false;
