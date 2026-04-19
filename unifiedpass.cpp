@@ -19,6 +19,7 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/raw_ostream.h>
+#include "llvm/Analysis/AliasAnalysis.h"
 using namespace llvm;
 
 namespace {
@@ -483,6 +484,122 @@ namespace {
   }
   };
 
+  struct AggressiveLICMPass : PassInfoMixin<AggressiveLICMPass> {
+    
+    // Identical to your standard pass, but allows Loads if they are proved invariant
+    bool isAggressiveInvariant(Instruction &I, Loop &L, const DenseSet<Instruction*> &HoistedSet, 
+                               const SmallVectorImpl<Instruction*> &MemoryWriters, AAResults &AA) {
+        
+        if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
+            return false;
+
+        // Relaxed Rule: Allow memory reads if we can prove they are invariant
+        if (I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
+            return false;
+
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            Value *Ptr = LI->getPointerOperand();
+            // Pointer itself must be invariant
+            if (L.contains(dyn_cast_or_null<Instruction>(Ptr)) && !HoistedSet.count(dyn_cast<Instruction>(Ptr)))
+                return false;
+
+            // Check against all instructions in the loop that might write to memory
+            MemoryLocation Loc = MemoryLocation::get(LI);
+            for (Instruction *W : MemoryWriters) {
+                if (isModSet(AA.getModRefInfo(W, Loc))) 
+                    return false; // Found a potential alias/write, cannot hoist
+            }
+        } else if (I.mayReadFromMemory()) {
+            return false; // Other memory-reading instructions (like calls) remain restricted
+        }
+
+        // Standard operand check (same as your original pass)
+        for (Value *Op : I.operands()) {
+            if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
+            if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+                if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst)) 
+                    return false;
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
+                          LoopStandardAnalysisResults &AR, LPMUpdater &U) {
+        
+        Function *F = L.getHeader()->getParent();
+        
+        // 1. Reuse your existing rotation logic
+        MyLICMSafetyPass helper; 
+        helper.rotateLoop(L, AR);
+
+        BasicBlock *Preheader = L.getLoopPreheader();
+        if (!Preheader) return PreservedAnalyses::all();
+
+        // 2. Collect all "Writers" once to speed up Alias Analysis checks
+        SmallVector<Instruction *, 16> MemoryWriters;
+        for (BasicBlock *BB : L.getBlocks())
+            for (Instruction &Inst : *BB)
+                if (Inst.mayWriteToMemory())
+                    MemoryWriters.push_back(&Inst);
+
+        // 3. Iterative Worklist (Same structure as your standard pass)
+        SmallVector<Instruction *, 16> Worklist;
+        DenseSet<Instruction *> HoistedSet;
+        SmallVector<Instruction *, 16> OrderedHoist;
+
+        for (BasicBlock *BB : L.getBlocks())
+            for (Instruction &I : *BB)
+                Worklist.push_back(&I);
+
+        while (!Worklist.empty()) {
+            Instruction *I = Worklist.pop_back_val();
+            if (HoistedSet.count(I)) continue;
+
+            // Use the Relaxed Invariance Rule + your custom MyDomTree
+            if (isAggressiveInvariant(*I, L, HoistedSet, MemoryWriters, AR.AA)) {
+                
+                // Re-build and use your custom MyDomTree
+                MyDomTree DT;
+                DT.build(*F);
+
+                SmallVector<BasicBlock *, 4> ExitingBlocks;
+                L.getExitingBlocks(ExitingBlocks);
+                
+                bool dominatesAllExits = true;
+                for (BasicBlock *EB : ExitingBlocks) {
+                    if (!DT.dominates(I->getParent(), EB)) {
+                        dominatesAllExits = false;
+                        break;
+                    }
+                }
+
+                if (dominatesAllExits || isSafeToSpeculativelyExecute(I)) {
+                    errs() << "    [AGGRESSIVE HOIST] " << *I << "\n";
+                    HoistedSet.insert(I);
+                    OrderedHoist.push_back(I);
+
+                    for (User *U : I->users())
+                        if (auto *UI = dyn_cast<Instruction>(U))
+                            if (L.contains(UI->getParent()))
+                                Worklist.push_back(UI);
+                }
+            }
+        }
+
+        if (OrderedHoist.empty()) return PreservedAnalyses::all();
+
+        Instruction *PreheaderTerminator = Preheader->getTerminator();
+        for (Instruction *Inst : OrderedHoist) {
+            Inst->moveBefore(PreheaderTerminator);
+        }
+
+        return PreservedAnalyses::none();
+    }
+  };
+
 } //namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
@@ -501,6 +618,10 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
           }
           else if (Name == "loop-invariant-code-motion") {
             FPM.addPass(createFunctionToLoopPassAdaptor(MyLICMSafetyPass()));
+            return true;
+          }
+          else if (Name == "aggressive-licm") {
+            FPM.addPass(createFunctionToLoopPassAdaptor(AggressiveLICMPass()));
             return true;
           }
           return false;
