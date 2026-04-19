@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 int test2(int x) {
     int a = 0;
     int b = 1;
