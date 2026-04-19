@@ -1,22 +1,32 @@
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <numeric>
 #include <string>
 #include <vector>
-
+ 
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/raw_ostream.h>
-#include "llvm/Analysis/ValueTracking.h"
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/LoopPass.h>
+#include <llvm/IR/Dominators.h>
+#include <llvm/Transforms/Utils/LoopUtils.h>
 using namespace llvm;
 
 namespace {
@@ -277,240 +287,99 @@ namespace {
 
   struct LICMPass : PassInfoMixin<LICMPass> {
 
-    // ------------------------------------------------------------
-    // Invariant candidate check
-    // ------------------------------------------------------------
-    static bool isInvariantCandidate(const Instruction* I) {
-      return isSafeToSpeculativelyExecute(I) &&
-            !I->mayReadFromMemory() &&
-            !isa<LandingPadInst>(I);
-    }
+    // Check if instruction is loop-invariant (LLVM-style simplified)
+    static bool isInvariant(Instruction *I,
+                            Loop *L,
+                            const SmallVectorImpl<Instruction*> &invariants) {
 
-    // ------------------------------------------------------------
-    // Build Immediate Dominator Map
-    // ------------------------------------------------------------
-    static DenseMap<BasicBlock*, BasicBlock*>
-    buildIDomMap(Function& F) {
-      std::vector<BasicBlock*> vertex;
-      DenseMap<BasicBlock*, int> index;
-      std::vector<int> parent;
-      int N = 0;
+      if (I->isTerminator()) return false;
+      if (I->mayHaveSideEffects()) return false;
+      if (isa<PHINode>(I)) return false;
 
-      std::function<void(BasicBlock*)> dfs = [&](BasicBlock* v) {
-        index[v] = N++;
-        vertex.push_back(v);
-        parent.push_back(-1);
-        for (auto* s : successors(v))
-          if (!index.count(s)) {
-            dfs(s);
-            parent[index[s]] = index[v];
-          }
-      };
-      dfs(&F.getEntryBlock());
+      for (Value *Op : I->operands()) {
+        if (isa<Constant>(Op)) continue;
 
-      std::vector<int> semi(N), idom(N, -1), ancestor(N, -1), label(N);
-      std::vector<std::vector<int>> bucket(N);
-      for (int i = 0; i < N; ++i) {
-        semi[i] = i;
-        label[i] = i;
-      }
+        if (auto *OpI = dyn_cast<Instruction>(Op)) {
+          if (!L->contains(OpI)) continue;
 
-      std::function<void(int)> compress = [&](int v) {
-        if (ancestor[v] != -1 && ancestor[ancestor[v]] != -1) {
-          compress(ancestor[v]);
-          if (semi[label[ancestor[v]]] < semi[label[v]])
-            label[v] = label[ancestor[v]];
-          ancestor[v] = ancestor[ancestor[v]];
-        }
-      };
-
-      std::function<int(int)> eval = [&](int v) -> int {
-        if (ancestor[v] == -1) return label[v];
-        compress(v);
-        return label[v];
-      };
-
-      for (int w = N - 1; w > 0; --w) {
-        for (auto* pred : predecessors(vertex[w])) {
-          if (!index.count(pred)) continue;
-          int u = eval(index[pred]);
-          semi[w] = std::min(semi[w], semi[u]);
-        }
-        bucket[semi[w]].push_back(w);
-        ancestor[w] = parent[w];
-
-        for (int v : bucket[parent[w]]) {
-          int u = eval(v);
-          idom[v] = (semi[u] < semi[v]) ? u : parent[w];
-        }
-        bucket[parent[w]].clear();
-      }
-
-      for (int i = 1; i < N; ++i)
-        if (idom[i] != semi[i])
-          idom[i] = idom[idom[i]];
-
-      DenseMap<BasicBlock*, BasicBlock*> idomMap;
-      idomMap[vertex[0]] = nullptr;
-      for (int i = 1; i < N; ++i)
-        idomMap[vertex[i]] = vertex[idom[i]];
-
-      return idomMap;
-    }
-
-    // ------------------------------------------------------------
-    // Dominance check
-    // ------------------------------------------------------------
-    static bool dominates(
-        BasicBlock* A,
-        BasicBlock* B,
-        const DenseMap<BasicBlock*, BasicBlock*>& idomMap) {
-
-      if (A == B) return true;
-      BasicBlock* cur = B;
-
-      while (cur) {
-        auto it = idomMap.find(cur);
-        if (it == idomMap.end() || it->second == nullptr) break;
-        cur = it->second;
-        if (cur == A) return true;
-      }
-      return false;
-    }
-
-    // ------------------------------------------------------------
-    static SmallVector<BasicBlock*, 4>
-    getExitBlocks(const SmallVector<BasicBlock*, 8>& loopBlocks) {
-
-      SmallPtrSet<BasicBlock*, 8> inLoop(loopBlocks.begin(), loopBlocks.end());
-      SmallVector<BasicBlock*, 4> exits;
-
-      for (BasicBlock* BB : loopBlocks)
-        for (BasicBlock* succ : successors(BB))
-          if (!inLoop.count(succ))
-            exits.push_back(succ);
-
-      return exits;
-    }
-
-    // ------------------------------------------------------------
-    bool processLoop(
-        Function& F,
-        const SmallVector<BasicBlock*, 8>& loopBlocks,
-        BasicBlock* header,
-        BasicBlock* preheader,
-        const DenseMap<BasicBlock*, BasicBlock*>& idomMap) {
-
-      // (your logic unchanged — just keep it here)
-      // NOTE: I removed nothing, just ensured parameters exist
-
-      return false; // placeholder (keep your original return logic)
-    }
-
-    // ------------------------------------------------------------
-    static SmallVector<BasicBlock*, 8>
-    collectLoopBlocks(
-        BasicBlock* header,
-        const DenseMap<BasicBlock*, BasicBlock*>& idomMap) {
-
-      SmallVector<BasicBlock*, 8> result;
-      SmallPtrSet<BasicBlock*, 8> visited;
-
-      SmallVector<BasicBlock*, 4> backEdgeTails;
-      for (BasicBlock* pred : predecessors(header))
-        if (dominates(header, pred, idomMap))
-          backEdgeTails.push_back(pred);
-
-      if (backEdgeTails.empty()) return result;
-
-      SmallVector<BasicBlock*, 8> worklist;
-      visited.insert(header);
-      result.push_back(header);
-
-      for (BasicBlock* tail : backEdgeTails) {
-        if (!visited.count(tail)) {
-          visited.insert(tail);
-          result.push_back(tail);
-          worklist.push_back(tail);
+          if (llvm::find(invariants, OpI) == invariants.end())
+            return false;
         }
       }
+      return true;
+    }
 
-      while (!worklist.empty()) {
-        BasicBlock* bb = worklist.pop_back_val();
-        for (BasicBlock* pred : predecessors(bb)) {
-          if (!visited.count(pred)) {
-            visited.insert(pred);
-            result.push_back(pred);
-            worklist.push_back(pred);
+    bool processLoop(Loop *L, DominatorTree &DT) {
+      BasicBlock *preheader = L->getLoopPreheader();
+      if (!preheader) {
+        errs() << "LICM: skipping loop (no preheader)\n";
+        return false;
+      }
+
+      bool changed = false;
+      SmallVector<Instruction*, 32> invariants;
+
+      bool progress = true;
+      while (progress) {
+        progress = false;
+
+        for (BasicBlock *BB : L->blocks()) {
+          for (Instruction &I : *BB) {
+
+            if (llvm::find(invariants, &I) != invariants.end())
+              continue;
+
+            if (!isInvariant(&I, L, invariants))
+              continue;
+
+            if (!isSafeToSpeculativelyExecute(&I))
+              continue;
+
+            invariants.push_back(&I);
+            progress = true;
           }
         }
       }
 
-      return result;
+      if (invariants.empty()) return false;
+
+      errs() << "LICM: found " << invariants.size()
+            << " invariants in loop headed by "
+            << getShortValueName(L->getHeader()) << "\n";
+
+      for (Instruction *I : invariants) {
+
+        // Ensure instruction dominates loop header (basic safety)
+        if (!DT.dominates(I->getParent(), L->getHeader()))
+          continue;
+
+        errs() << "LICM hoisting: " << *I << "\n";
+
+        I->moveBefore(preheader->getTerminator());
+        changed = true;
+      }
+
+      return changed;
     }
 
-    // ------------------------------------------------------------
-    static BasicBlock*
-    getPreheader(BasicBlock* header,
-                const SmallPtrSet<BasicBlock*, 8>& inLoop) {
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
 
-      BasicBlock* pre = nullptr;
-      for (BasicBlock* pred : predecessors(header)) {
-        if (!inLoop.count(pred)) {
-          if (pre) return nullptr;
-          pre = pred;
-        }
-      }
-      return pre;
-    }
+      errs() << "=== LICM: " << F.getName() << " ===\n";
 
-    // ------------------------------------------------------------
-    // MAIN ENTRY (ONLY ONE run FUNCTION!)
-    // ------------------------------------------------------------
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
+      auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+      auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-      errs() << "=== LICM Pass: " << F.getName() << " ===\n";
+      bool changed = false;
 
-      DenseMap<BasicBlock*, BasicBlock*> idomMap = buildIDomMap(F);
+      // Process all loops (including nested)
+      for (Loop *L : LI)
+        changed |= processLoop(L, DT);
 
-      SmallVector<BasicBlock*, 8> headers;
-      for (BasicBlock& BB : F) {
-        for (BasicBlock* pred : predecessors(&BB)) {
-          if (dominates(&BB, pred, idomMap)) {
-            headers.push_back(&BB);
-            break;
-          }
-        }
-      }
-
-      if (headers.empty())
-        return PreservedAnalyses::all();
-
-      bool anyChange = false;
-
-      for (BasicBlock* header : llvm::reverse(headers)) {
-
-        SmallVector<BasicBlock*, 8> loopBlocks =
-            collectLoopBlocks(header, idomMap);
-
-        if (loopBlocks.empty()) continue;
-
-        SmallPtrSet<BasicBlock*, 8> inLoop(loopBlocks.begin(), loopBlocks.end());
-        BasicBlock* preheader = getPreheader(header, inLoop);
-
-        if (!preheader) continue;
-
-        if (anyChange)
-          idomMap = buildIDomMap(F);
-
-        bool changed = processLoop(F, loopBlocks, header, preheader, idomMap);
-        anyChange |= changed;
-      }
-
-      return anyChange ? PreservedAnalyses::none()
-                      : PreservedAnalyses::all();
+      return changed ? PreservedAnalyses::none()
+                    : PreservedAnalyses::all();
     }
   };
+
 } //namespace
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
