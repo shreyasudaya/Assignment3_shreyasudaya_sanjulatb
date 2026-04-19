@@ -32,11 +32,11 @@ namespace {
     return S;
   }
 
+  //Dominator Tree should be stored to be used in LICM
   class Dominator_Tree {
     DenseMap<BasicBlock*, BasicBlock*> IDoms;
 
   public:
-    // The logic we already wrote, moved here
     void build(Function &F) {
       std::vector<BasicBlock*> blocks;
       DenseMap<BasicBlock*, unsigned> blockIndices;
@@ -50,6 +50,7 @@ namespace {
       std::vector<BitVector> doms(N, BitVector(N, true));
       doms[0].reset(); doms[0].set(0);
 
+      //Iteratively compute dominators until convergence
       bool changed = true;
       while (changed) {
         changed = false;
@@ -68,6 +69,7 @@ namespace {
         }
       }
 
+      //Extract immediate dominators from the final dominator sets
       IDoms[blocks[0]] = blocks[0];
       for (unsigned i = 1; i < N; ++i) {
         for (unsigned d = 0; d < N; ++d) {
@@ -82,6 +84,7 @@ namespace {
       }
     }
 
+    //Helper function to check if A dominates B using the IDoms map
     bool dominates(BasicBlock *A, BasicBlock *B) {
       if (A == B) return true;
       BasicBlock *Curr = B;
@@ -92,13 +95,15 @@ namespace {
       return false;
     }
     
+    //Helper function to get the immediate dominator of a block
     BasicBlock* getIDom(BasicBlock *BB) { return IDoms.lookup(BB); }
   };  
 
+  //Dominator Analysis Pass
   struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
       Dominator_Tree DT;
-      DT.build(F); // Run calculation
+      DT.build(F); 
       
       errs() << "Dominator Tree for " << F.getName() << "\n";
       for (BasicBlock &BB : F) {
@@ -110,14 +115,14 @@ namespace {
     }
   };
 
-
+  //Dead Code Elimination Pass using Faint Variable Analysis
   struct DCEPass : PassInfoMixin<DCEPass> {
-    //Liveness conditions
+    //Liveness conditions (according to the assignment spec):
     static bool isLive(const Instruction* I) {
       if (I->isTerminator()) return true;
       if (isa<DbgInfoIntrinsic>(I)) return true;
       if (I->mayHaveSideEffects()) return true; 
-      if (I->getType()->isVoidTy()) return true;
+      if (isa<LandingPadInst>(I)) return true;
       return false;
     }
 
@@ -147,6 +152,7 @@ namespace {
         }
       }
 
+      //Iteratively compute FaintIn and FaintOut until convergence
       bool changed = true;
       while (changed) {
         changed = false;
@@ -194,8 +200,8 @@ namespace {
             //FaintKill = {Rhs if Lhs is useful} U Use
             BitVector FaintKill(universe.size(), false);
             for (int lhsIdx : Lhs.set_bits()) {
-              if (!faintOut[&I].test(lhsIdx)) { // This Lhs var is NOT faint (is useful)
-                FaintKill |= Rhs;               // Kill all Rhs vars
+              if (!faintOut[&I].test(lhsIdx)) { 
+                FaintKill |= Rhs;              
                 break;
               }
             }
@@ -227,7 +233,7 @@ namespace {
             //Assignment is dead if its result is faint at the exit of the instruction
             if (faintOut[&I].test(idx)) {
               toRemove.push_back(&I);
-              errs() << I << "\n";     // Prints instruction details
+              errs() << I << "\n";    
             }
           }
         }
@@ -243,149 +249,125 @@ namespace {
     }
   };
 
-  // Checks if the instruction is safe to hoist out of the loop
-  bool isSafeToHoist(Instruction *I) {
-      return isSafeToSpeculativelyExecute(I) && 
-            !I->mayReadFromMemory() && 
-            !isa<LandingPadInst>(I);
-  }
-
-  // Checks if all operands of an instruction are loop-invariant
-  bool hasLoopInvariantOperands(Instruction *I, Loop *L, const std::set<Instruction*> &InvariantSet) {
-      for (Use &U : I->operands()) {
-          Value *V = U.get();
-          
-          // Constants and Arguments are always loop-invariant
-          if (isa<Constant>(V) || isa<Argument>(V)) {
-              continue;
-          }
-          
-          if (Instruction *OpInst = dyn_cast<Instruction>(V)) {
-              // If the operand is an instruction defined OUTSIDE the loop, it's invariant
-              if (!L->contains(OpInst)) {
-                  continue;
-              }
-              // If it's defined INSIDE the loop, it must already be in our InvariantSet
-              if (InvariantSet.count(OpInst)) {
-                  continue;
-              }
-          }
-          
-          // If we reach here, at least one operand is modified inside the loop and not invariant
-          return false;
-      }
-      return true; // All operands passed the checks
-  }
-
   struct MyLICMSafetyPass : PassInfoMixin<MyLICMSafetyPass> {
-    // TWEAK: Explicitly ignore PHI nodes to prevent breaking SSA form during hoisting
-    // Added DenseSet to track instructions queued for hoisting
+    
     bool isInstructionInvariant(Instruction &I, Loop &L, const DenseSet<Instruction*> &HoistedSet) {
-        if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
-            return false;
-        
-        // Explicitly check for side effects or memory reads
-        if (I.mayReadFromMemory() || I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
-            return false;
+      if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
+        return false;
+      
+      //Explicitly check for side effects or memory reads
+      //Uses the conditions from the assignment spec:
+      if (I.mayReadFromMemory() || I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
+        return false;
 
-        for (Value *Op : I.operands()) {
-            if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
-            if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
-                // An operand is valid if it's defined outside the loop 
-                // OR if it's already in our 'to-be-hoisted' set.
-                if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst)) 
-                    return false;
-                continue;
-            }
-            return false;
+      for (Value *Op : I.operands()) {
+        //Constants and Arguments are always invariant
+        if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
+        if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+            //An operand is valid if it's defined outside the loop 
+            //OR if it's already in our 'to-be-hoisted' set.
+            //Reaching definitions can be computed easily due to SSA form, 
+            //So we just check the defining instruction's block against the loop.
+            if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst)) 
+                return false;
+            continue;
         }
-        return true;
+        return false; //If we encounter a non-instruction operand that isn't a constant or argument, we conservatively treat it as variant
+      }
+      return true; //If all checks passed, the instruction is invariant
     }
 
-
+    //This function performs the loop rotation transformation as described in the assignment spec
+    //According to Figure 10
     void rotateLoop(Loop &L, LoopStandardAnalysisResults &AR) {
-        BasicBlock *OrigHeader = L.getHeader();
-        BasicBlock *Latch      = L.getLoopLatch();
-        BasicBlock *Preheader  = L.getLoopPreheader();
-        Function   *F          = OrigHeader->getParent();
-        LLVMContext &Ctx       = F->getContext();
+      BasicBlock *OrigHeader = L.getHeader();
+      BasicBlock *Latch      = L.getLoopLatch();
+      BasicBlock *Preheader  = L.getLoopPreheader();
+      Function   *F          = OrigHeader->getParent();
+      LLVMContext &Ctx       = F->getContext();
 
-        // 1. Create the new blocks
-        BasicBlock *LandingPad = BasicBlock::Create(Ctx, "loop.landing", F, OrigHeader);
-        BasicBlock *CondBlock  = BasicBlock::Create(Ctx, "loop.cond", F);
+      //Create the new blocks
+      BasicBlock *LandingPad = BasicBlock::Create(Ctx, "loop.landingpad", F, OrigHeader);
+      BasicBlock *CondBlock  = BasicBlock::Create(Ctx, "loop.cond", F);
 
-        auto *OrigTerm = cast<BranchInst>(OrigHeader->getTerminator());
-        BasicBlock *LoopBodySucc = OrigTerm->getSuccessor(0);
-        BasicBlock *ExitBlock    = OrigTerm->getSuccessor(1);
-        if (!L.contains(LoopBodySucc)) std::swap(LoopBodySucc, ExitBlock);
+      //Identify the Loop Body Successor and Exit Block from the original terminator
+      auto *OrigTerm = cast<BranchInst>(OrigHeader->getTerminator());
+      BasicBlock *LoopBodySucc = OrigTerm->getSuccessor(0);
+      BasicBlock *ExitBlock    = OrigTerm->getSuccessor(1);
+      //Ensure LoopBodySucc is the one that stays in the loop after rotation
+      if (!L.contains(LoopBodySucc)) std::swap(LoopBodySucc, ExitBlock);
 
-        // 2. Map original PHIs to their initial values BEFORE replacement
-        DenseMap<PHINode*, Value*> PhiToInitMap;
-        std::vector<PHINode*> PHIs;
-        for (PHINode &PN : OrigHeader->phis()) {
-            PHIs.push_back(&PN);
-            PhiToInitMap[&PN] = PN.getIncomingValueForBlock(Preheader);
+      //Store original PHIs to their initial values BEFORE replacement
+      DenseMap<PHINode*, Value*> PhiToInitMap;
+      std::vector<PHINode*> PHIs;
+      for (PHINode &PN : OrigHeader->phis()) {
+        PHIs.push_back(&PN);
+        PhiToInitMap[&PN] = PN.getIncomingValueForBlock(Preheader);
+      }
+
+      //Clone condition for the new Latch (CondBlock - BB with the backedge to the header)
+      Value *Cond = OrigTerm->getCondition();
+      Instruction *ClonedCondInst = nullptr; 
+      if (auto *CondInst = dyn_cast<Instruction>(Cond)) {
+        if (CondInst->getParent() == OrigHeader) {
+          ClonedCondInst = CondInst->clone();
+          ClonedCondInst->insertInto(CondBlock, CondBlock->end());
+          Cond = ClonedCondInst;
         }
+      }
 
-        // 3. Clone condition for the new Latch (CondBlock)
-        Value *Cond = OrigTerm->getCondition();
-        Instruction *ClonedCondInst = nullptr; // <--- Add this tracker
-        if (auto *CondInst = dyn_cast<Instruction>(Cond)) {
-            if (CondInst->getParent() == OrigHeader) {
-                ClonedCondInst = CondInst->clone();
-                ClonedCondInst->insertInto(CondBlock, CondBlock->end());
-                Cond = ClonedCondInst;
+      //Setup Branch Logic for the new blocks
+      //Create br OrigHeader -> {LandingPad, ExitBlock}
+      BranchInst::Create(LandingPad, ExitBlock, OrigTerm->getCondition(), OrigHeader);
+      OrigTerm->eraseFromParent();
+      //Create br Landingpad -> LoopBodySucc 
+      BranchInst::Create(LoopBodySucc, LandingPad);
+      //Create br CondBlock -> {LoopBodySucc, ExitBlock}
+      BranchInst::Create(LoopBodySucc, ExitBlock, Cond, CondBlock);
+      //Create br Latch -> CondBlock
+      CondBlock->moveAfter(Latch);
+      Latch->getTerminator()->replaceSuccessorWith(OrigHeader, CondBlock);
+
+      //Update LoopInfo to reflect the new structure
+      L.removeBlockFromLoop(OrigHeader);
+      L.addBasicBlockToLoop(CondBlock,AR.LI);
+      L.moveToHeader(LoopBodySucc);
+
+      //As new edges are added to the original header, 
+      //We need to update PHI nodes in the ExitBlock that used to have incoming values from the original header
+      //Create Rotated PHIs and update LCSSA
+      for (PHINode *OrigPHI : PHIs) {
+        Value *InitVal = PhiToInitMap[OrigPHI];
+        Value *LoopVal = OrigPHI->getIncomingValueForBlock(Latch);
+        if (ClonedCondInst) {
+            ClonedCondInst->replaceUsesOfWith(OrigPHI, LoopVal);
+        }
+        PHINode *NewPHI = PHINode::Create(OrigPHI->getType(), 2, OrigPHI->getName() + ".rot", 
+                                          LoopBodySucc->getFirstNonPHIIt());
+        NewPHI->addIncoming(InitVal, LandingPad);
+        NewPHI->addIncoming(LoopVal, CondBlock);
+
+        //Update LCSSA PHIs in ExitBlock specifically
+        for (PHINode &ExitPHI : ExitBlock->phis()) {
+          for (unsigned i = 0; i < ExitPHI.getNumIncomingValues(); ++i) {
+            if (ExitPHI.getIncomingValue(i) == OrigPHI && ExitPHI.getIncomingBlock(i) == OrigHeader) {
+                //Path from Guard: Use Initial Value
+                ExitPHI.setIncomingValue(i, InitVal); 
+                //Path from New Latch: Use Loop Value (the Rotated PHI)
+                ExitPHI.addIncoming(NewPHI, CondBlock);
             }
+          }
         }
 
-        // 4. Setup Branch Logic
-        BranchInst::Create(LandingPad, ExitBlock, OrigTerm->getCondition(), OrigHeader);
-        OrigTerm->eraseFromParent();
-        BranchInst::Create(LoopBodySucc, LandingPad);
-        BranchInst::Create(LoopBodySucc, ExitBlock, Cond, CondBlock);
-        CondBlock->moveAfter(Latch);
-        Latch->getTerminator()->replaceSuccessorWith(OrigHeader, CondBlock);
+        //Update all other users (excluding the Guard block)
+        OrigPHI->replaceUsesWithIf(NewPHI, [OrigHeader](Use &U) {
+          if (auto *UI = dyn_cast<Instruction>(U.getUser()))
+              return UI->getParent() != OrigHeader;
+          return true;
+        });
 
-        // 5. Create Rotated PHIs and update LCSSA
-        for (PHINode *OrigPHI : PHIs) {
-          Value *InitVal = PhiToInitMap[OrigPHI];
-          Value *LoopVal = OrigPHI->getIncomingValueForBlock(Latch);
-
-          if (ClonedCondInst) {
-              ClonedCondInst->replaceUsesOfWith(OrigPHI, LoopVal);
-          }
-          
-          PHINode *NewPHI = PHINode::Create(OrigPHI->getType(), 2, OrigPHI->getName() + ".rot", 
-                                            LoopBodySucc->getFirstNonPHIIt());
-          NewPHI->addIncoming(InitVal, LandingPad);
-          NewPHI->addIncoming(LoopVal, CondBlock);
-
-          // Update LCSSA PHIs in ExitBlock specifically
-          for (PHINode &ExitPHI : ExitBlock->phis()) {
-              for (unsigned i = 0; i < ExitPHI.getNumIncomingValues(); ++i) {
-                  if (ExitPHI.getIncomingValue(i) == OrigPHI && ExitPHI.getIncomingBlock(i) == OrigHeader) {
-                      // Path from Guard: Use Initial Value
-                      ExitPHI.setIncomingValue(i, InitVal); 
-                      // Path from New Latch: Use Loop Value (the Rotated PHI)
-                      ExitPHI.addIncoming(NewPHI, CondBlock);
-                  }
-              }
-          }
-
-          // Update all other users (excluding the Guard block)
-          OrigPHI->replaceUsesWithIf(NewPHI, [OrigHeader](Use &U) {
-              if (auto *UI = dyn_cast<Instruction>(U.getUser()))
-                  return UI->getParent() != OrigHeader;
-              return true;
-          });
-
-          
-          OrigPHI->removeIncomingValue(Latch, false);
-        }
-        
-        L.removeBlockFromLoop(OrigHeader);
-        L.addBasicBlockToLoop(CondBlock,AR.LI);
-        L.moveToHeader(LoopBodySucc);
+        OrigPHI->removeIncomingValue(Latch, false);
+      }
     }
     
     PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
@@ -393,10 +375,11 @@ namespace {
     
       Function *F = L.getHeader()->getParent();
       
-      // 1. Rotate the loop (Using the fixed logic from the previous step)
+      //Rotate the loop to include a landing pad and a condition block as described in the assignment spec
       rotateLoop(L,AR);
 
       BasicBlock *Preheader = L.getLoopPreheader();
+      //Assume that loop-simply pass is applied:
       if (!Preheader) {
           errs() << "Skipping: No preheader available for hoisting.\n";
           return PreservedAnalyses::all();
@@ -405,31 +388,31 @@ namespace {
       SmallVector<BasicBlock *, 4> ExitingBlocks;
       L.getExitingBlocks(ExitingBlocks);
 
-      // --- NEW: Iterative Logic Structures ---
+      //For iterative worklist approach
       SmallVector<Instruction *, 16> Worklist;
-      DenseSet<Instruction *> HoistedSet;        // Tracks what will be moved
-      SmallVector<Instruction *, 16> OrderedHoist; // Maintains dependency order
+      DenseSet<Instruction *> HoistedSet;        //Tracks what will be moved
+      SmallVector<Instruction *, 16> OrderedHoist; //Maintains dependency order
 
       errs() << "\n--- Analyzing Rotated Loop: " << L.getHeader()->getName() << " ---\n";
 
-      // Initialize worklist with all instructions
+      //Initialize worklist with all instructions
       for (BasicBlock *BB : L.getBlocks())
           for (Instruction &I : *BB)
               Worklist.push_back(&I);
 
+      //Build Dominator Tree for the function      
       Dominator_Tree DT;
       DT.build(*F);
 
-      // Iteratively process the worklist
+      //Iteratively process the worklist
       while (!Worklist.empty()) {
           Instruction *I = Worklist.pop_back_val();
-
-          // Skip if already marked or is a PHI/Terminator (handled by isInstructionInvariant)
+          //Skip if already marked or is a PHI/Terminator
           if (HoistedSet.count(I)) continue;
 
-          // TWEAK: Pass HoistedSet to check if operands are "effectively" invariant
+          //Pass HoistedSet to check if operands are transitively invariant
           if (isInstructionInvariant(*I, L, HoistedSet)) {
-              
+              //Check if it dominates all exits
               bool dominatesAllExits = true;
               BasicBlock *InstBB = I->getParent();
               for (BasicBlock *EB : ExitingBlocks) {
@@ -439,12 +422,13 @@ namespace {
                   }
               }
 
+              //If an instruction is invariant and dominates all exits, it's safe to hoist.
               if (dominatesAllExits) {
                   errs() << "    [SAFE - MARKED FOR HOISTING] " << *I << "\n";
                   HoistedSet.insert(I);
                   OrderedHoist.push_back(I);
 
-                  // Since I is now invariant, its users might become invariant too
+                  //Since I is now invariant, its users might become invariant
                   for (User *U : I->users())
                       if (auto *UI = dyn_cast<Instruction>(U))
                           if (L.contains(UI->getParent()))
@@ -458,7 +442,7 @@ namespace {
           return PreservedAnalyses::all();
       }
 
-      // Hoist in discovered order to preserve dependencies
+      //Hoist in discovered order to preserve dependencies
       Instruction *PreheaderTerminator = Preheader->getTerminator();
       auto InsertPos = PreheaderTerminator->getIterator();
       for (Instruction *Inst : OrderedHoist) {
@@ -467,7 +451,7 @@ namespace {
 
       errs() << "--- Successfully hoisted " << OrderedHoist.size() << " instructions. ---\n";
       return PreservedAnalyses::none();
-  }
+    }
   };
 
   struct AggressiveLICMPass : PassInfoMixin<AggressiveLICMPass> {
