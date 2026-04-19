@@ -18,7 +18,8 @@ OPTIMIZER_SOURCES = unifiedpass.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 
 # --- Tests ---
-TESTS        = dead-code-elimination dominator licm
+TEST_SRCS    = $(wildcard tests/*/*.c)
+TESTS        = $(TEST_SRCS:tests/%.c=%)
 TESTS_PRE    = $(TESTS:%=$(TESTDIR)/%-m2r.ll)
 TESTS_OUT    = $(TESTS:%=$(TESTDIR)/%-opt.ll)
 
@@ -46,23 +47,29 @@ $(BUILDDIR)/%.so: $(BUILDDIR)/%.o
 # --- 2. The Test Pipeline ---
 
 # Step A: C -> Raw Bitcode (Allocas/Loads/Stores)
-$(TESTDIR)/%.bc: tests/%.c | $(TESTDIR)
+$(TESTDIR)/%.bc: tests/%.c
+	@mkdir -p $(dir $@)
 	clang -O0 -Xclang -disable-O0-optnone -fno-discard-value-names -emit-llvm -c $< -o $@
 
 # Step B: Raw Bitcode -> SSA Bitcode (Virtual Registers & PHI nodes)
 # This uses the built-in mem2reg pass
 $(TESTDIR)/%-m2r.bc: $(TESTDIR)/%.bc
+	@mkdir -p $(dir $@)
 	opt -passes=mem2reg $< -o $@
 
 # Step C: SSA Bitcode -> Optimized Bitcode (Running your Plugin)
 $(TESTDIR)/%-opt.bc: $(TESTDIR)/%-m2r.bc $(OPTIMIZER_LIBS)
-	opt $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) -passes='$*' $< -o $@
+	@mkdir -p $(dir $@)
+	$(eval PASS := $(patsubst %/,%,$(dir $*)))
+	opt $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) -passes='$(PASS)' $< -o $@
 
 # Step D: Bitcode -> Human Readable IR (.ll files)
 $(TESTDIR)/%-opt.ll: $(TESTDIR)/%-opt.bc
+	@mkdir -p $(dir $@)
 	llvm-dis $< -o $@
 
 $(TESTDIR)/%-m2r.ll: $(TESTDIR)/%-m2r.bc
+	@mkdir -p $(dir $@)
 	llvm-dis $< -o $@
 
 # --- Helpers ---
