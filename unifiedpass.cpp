@@ -343,11 +343,12 @@ namespace {
 
         // 3. Clone condition for the new Latch (CondBlock)
         Value *Cond = OrigTerm->getCondition();
+        Instruction *ClonedCondInst = nullptr; // <--- Add this tracker
         if (auto *CondInst = dyn_cast<Instruction>(Cond)) {
             if (CondInst->getParent() == OrigHeader) {
-                Instruction *Cloned = CondInst->clone();
-                Cloned->insertInto(CondBlock, CondBlock->end());
-                Cond = Cloned;
+                ClonedCondInst = CondInst->clone();
+                ClonedCondInst->insertInto(CondBlock, CondBlock->end());
+                Cond = ClonedCondInst;
             }
         }
 
@@ -364,6 +365,10 @@ namespace {
           Value *InitVal = PhiToInitMap[OrigPHI];
           Value *LoopVal = OrigPHI->getIncomingValueForBlock(Latch);
 
+          if (ClonedCondInst) {
+              ClonedCondInst->replaceUsesOfWith(OrigPHI, LoopVal);
+          }
+          
           PHINode *NewPHI = PHINode::Create(OrigPHI->getType(), 2, OrigPHI->getName() + ".rot", 
                                             LoopBodySucc->getFirstNonPHI());
           NewPHI->addIncoming(InitVal, LandingPad);
