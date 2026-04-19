@@ -1,19 +1,16 @@
 #include <algorithm>
-#include <cstdint>
 #include <functional>
-#include <numeric>
 #include <string>
 #include <vector>
- 
-#include <llvm/ADT/BitVector.h>
+
+#include "llvm/IR/Dominators.h"
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/CFG.h>
-#include <llvm/IR/Constants.h>
-#include <llvm/IR/Dominators.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instruction.h>
@@ -22,11 +19,6 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/raw_ostream.h>
-#include <llvm/Transforms/Utils/BasicBlockUtils.h>
-#include <llvm/Analysis/LoopInfo.h>
-#include <llvm/Analysis/LoopPass.h>
-#include <llvm/IR/Dominators.h>
-#include <llvm/Transforms/Utils/LoopUtils.h>
 using namespace llvm;
 
 namespace {
@@ -267,99 +259,238 @@ namespace {
     }
   };
 
-  struct LICMPass : PassInfoMixin<LICMPass> {
+  // Checks if the instruction is safe to hoist out of the loop
+  bool isSafeToHoist(Instruction *I) {
+      return isSafeToSpeculativelyExecute(I) && 
+            !I->mayReadFromMemory() && 
+            !isa<LandingPadInst>(I);
+  }
 
-    // Check if instruction is loop-invariant (LLVM-style simplified)
-    static bool isInvariant(Instruction *I,
-                            Loop *L,
-                            const SmallVectorImpl<Instruction*> &invariants) {
+  // Checks if all operands of an instruction are loop-invariant
+  bool hasLoopInvariantOperands(Instruction *I, Loop *L, const std::set<Instruction*> &InvariantSet) {
+      for (Use &U : I->operands()) {
+          Value *V = U.get();
+          
+          // Constants and Arguments are always loop-invariant
+          if (isa<Constant>(V) || isa<Argument>(V)) {
+              continue;
+          }
+          
+          if (Instruction *OpInst = dyn_cast<Instruction>(V)) {
+              // If the operand is an instruction defined OUTSIDE the loop, it's invariant
+              if (!L->contains(OpInst)) {
+                  continue;
+              }
+              // If it's defined INSIDE the loop, it must already be in our InvariantSet
+              if (InvariantSet.count(OpInst)) {
+                  continue;
+              }
+          }
+          
+          // If we reach here, at least one operand is modified inside the loop and not invariant
+          return false;
+      }
+      return true; // All operands passed the checks
+  }
 
-      if (I->isTerminator()) return false;
-      if (I->mayHaveSideEffects()) return false;
-      if (isa<PHINode>(I)) return false;
+  struct MyLICMSafetyPass : PassInfoMixin<MyLICMSafetyPass> {
+    // TWEAK: Explicitly ignore PHI nodes to prevent breaking SSA form during hoisting
+    // Added DenseSet to track instructions queued for hoisting
+    bool isInstructionInvariant(Instruction &I, Loop &L, const DenseSet<Instruction*> &HoistedSet) {
+        if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
+            return false;
+        
+        // Explicitly check for side effects or memory reads
+        if (I.mayReadFromMemory() || I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
+            return false;
 
-      for (Value *Op : I->operands()) {
-        if (isa<Constant>(Op)) continue;
-
-        if (auto *OpI = dyn_cast<Instruction>(Op)) {
-          if (!L->contains(OpI)) continue;
-
-          if (llvm::find(invariants, OpI) == invariants.end())
+        for (Value *Op : I.operands()) {
+            if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
+            if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+                // An operand is valid if it's defined outside the loop 
+                // OR if it's already in our 'to-be-hoisted' set.
+                if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst)) 
+                    return false;
+                continue;
+            }
             return false;
         }
-      }
-      return true;
+        return true;
     }
 
-    bool processLoop(Loop *L, DominatorTree &DT) {
-      BasicBlock *preheader = L->getLoopPreheader();
-      if (!preheader) {
-        errs() << "LICM: skipping loop (no preheader)\n";
-        return false;
-      }
 
-      bool changed = false;
-      SmallVector<Instruction*, 32> invariants;
+    void rotateLoop(Loop &L, LoopStandardAnalysisResults &AR) {
+        BasicBlock *OrigHeader = L.getHeader();
+        BasicBlock *Latch      = L.getLoopLatch();
+        BasicBlock *Preheader  = L.getLoopPreheader();
+        Function   *F          = OrigHeader->getParent();
+        LLVMContext &Ctx       = F->getContext();
 
-      bool progress = true;
-      while (progress) {
-        progress = false;
+        // 1. Create the new blocks
+        BasicBlock *LandingPad = BasicBlock::Create(Ctx, "loop.landing", F, OrigHeader);
+        BasicBlock *CondBlock  = BasicBlock::Create(Ctx, "loop.cond", F);
 
-        for (BasicBlock *BB : L->blocks()) {
-          for (Instruction &I : *BB) {
+        auto *OrigTerm = cast<BranchInst>(OrigHeader->getTerminator());
+        BasicBlock *LoopBodySucc = OrigTerm->getSuccessor(0);
+        BasicBlock *ExitBlock    = OrigTerm->getSuccessor(1);
+        if (!L.contains(LoopBodySucc)) std::swap(LoopBodySucc, ExitBlock);
 
-            if (llvm::find(invariants, &I) != invariants.end())
-              continue;
-
-            if (!isInvariant(&I, L, invariants))
-              continue;
-
-            if (!isSafeToSpeculativelyExecute(&I))
-              continue;
-
-            invariants.push_back(&I);
-            progress = true;
-          }
+        // 2. Map original PHIs to their initial values BEFORE replacement
+        DenseMap<PHINode*, Value*> PhiToInitMap;
+        std::vector<PHINode*> PHIs;
+        for (PHINode &PN : OrigHeader->phis()) {
+            PHIs.push_back(&PN);
+            PhiToInitMap[&PN] = PN.getIncomingValueForBlock(Preheader);
         }
+
+        // 3. Clone condition for the new Latch (CondBlock)
+        Value *Cond = OrigTerm->getCondition();
+        if (auto *CondInst = dyn_cast<Instruction>(Cond)) {
+            if (CondInst->getParent() == OrigHeader) {
+                Instruction *Cloned = CondInst->clone();
+                Cloned->insertInto(CondBlock, CondBlock->end());
+                Cond = Cloned;
+            }
+        }
+
+        // 4. Setup Branch Logic
+        BranchInst::Create(LandingPad, ExitBlock, OrigTerm->getCondition(), OrigHeader);
+        OrigTerm->eraseFromParent();
+        BranchInst::Create(LoopBodySucc, LandingPad);
+        BranchInst::Create(LoopBodySucc, ExitBlock, Cond, CondBlock);
+        CondBlock->moveAfter(Latch);
+        Latch->getTerminator()->replaceSuccessorWith(OrigHeader, CondBlock);
+
+        // 5. Create Rotated PHIs and update LCSSA
+        for (PHINode *OrigPHI : PHIs) {
+          Value *InitVal = PhiToInitMap[OrigPHI];
+          Value *LoopVal = OrigPHI->getIncomingValueForBlock(Latch);
+
+          PHINode *NewPHI = PHINode::Create(OrigPHI->getType(), 2, OrigPHI->getName() + ".rot", 
+                                            LoopBodySucc->getFirstNonPHI());
+          NewPHI->addIncoming(InitVal, LandingPad);
+          NewPHI->addIncoming(LoopVal, CondBlock);
+
+          // Update LCSSA PHIs in ExitBlock specifically
+          for (PHINode &ExitPHI : ExitBlock->phis()) {
+              for (unsigned i = 0; i < ExitPHI.getNumIncomingValues(); ++i) {
+                  if (ExitPHI.getIncomingValue(i) == OrigPHI && ExitPHI.getIncomingBlock(i) == OrigHeader) {
+                      // Path from Guard: Use Initial Value
+                      ExitPHI.setIncomingValue(i, InitVal); 
+                      // Path from New Latch: Use Loop Value (the Rotated PHI)
+                      ExitPHI.addIncoming(NewPHI, CondBlock);
+                  }
+              }
+          }
+
+          // Update all other users (excluding the Guard block)
+          OrigPHI->replaceUsesWithIf(NewPHI, [OrigHeader](Use &U) {
+              if (auto *UI = dyn_cast<Instruction>(U.getUser()))
+                  return UI->getParent() != OrigHeader;
+              return true;
+          });
+
+          
+          OrigPHI->removeIncomingValue(Latch, false);
+        }
+
+        // 6. Final Analysis Update
+        // 6. Final Analysis Update
+        Loop *ParentLoop = L.getParentLoop();
+
+        // 6a. OrigHeader is now the loop guard. It belongs outside this loop.
+        L.removeBlockFromLoop(OrigHeader);
+        AR.LI.changeLoopFor(OrigHeader, ParentLoop);
+
+        // 6b. LandingPad is essentially the new preheader. It belongs outside.
+        // (Do NOT add it to &L)
+        AR.LI.changeLoopFor(LandingPad, ParentLoop);
+
+        // 6c. CondBlock is the new latch. It belongs inside the loop.
+        L.addBasicBlockToLoop(CondBlock, AR.LI);
+
+        // 6d. Officially move the loop's entry point to the rotated body.
+        L.moveToHeader(LoopBodySucc);
+
+        // 6e. Recalculate Dominator Tree
+        AR.DT.recalculate(*F);
+    }
+    
+    PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
+                      LoopStandardAnalysisResults &AR, LPMUpdater &U) {
+    
+      Function *F = L.getHeader()->getParent();
+      
+      // 1. Rotate the loop (Using the fixed logic from the previous step)
+      rotateLoop(L, AR);
+
+      BasicBlock *Preheader = L.getLoopPreheader();
+      if (!Preheader) {
+          errs() << "Skipping: No preheader available for hoisting.\n";
+          return PreservedAnalyses::all();
       }
 
-      if (invariants.empty()) return false;
+      SmallVector<BasicBlock *, 4> ExitingBlocks;
+      L.getExitingBlocks(ExitingBlocks);
 
-      errs() << "LICM: found " << invariants.size()
-            << " invariants in loop headed by "
-            << getShortValueName(L->getHeader()) << "\n";
+      // --- NEW: Iterative Logic Structures ---
+      SmallVector<Instruction *, 16> Worklist;
+      DenseSet<Instruction *> HoistedSet;        // Tracks what will be moved
+      SmallVector<Instruction *, 16> OrderedHoist; // Maintains dependency order
 
-      for (Instruction *I : invariants) {
+      errs() << "\n--- Analyzing Rotated Loop: " << L.getHeader()->getName() << " ---\n";
 
-        // Ensure instruction dominates loop header (basic safety)
-        if (!DT.dominates(I->getParent(), L->getHeader()))
-          continue;
+      // Initialize worklist with all instructions
+      for (BasicBlock *BB : L.getBlocks())
+          for (Instruction &I : *BB)
+              Worklist.push_back(&I);
 
-        errs() << "LICM hoisting: " << *I << "\n";
+      // Iteratively process the worklist
+      while (!Worklist.empty()) {
+          Instruction *I = Worklist.pop_back_val();
 
-        I->moveBefore(preheader->getTerminator());
-        changed = true;
+          // Skip if already marked or is a PHI/Terminator (handled by isInstructionInvariant)
+          if (HoistedSet.count(I)) continue;
+
+          // TWEAK: Pass HoistedSet to check if operands are "effectively" invariant
+          if (isInstructionInvariant(*I, L, HoistedSet)) {
+              
+              bool dominatesAllExits = true;
+              for (BasicBlock *EB : ExitingBlocks) {
+                  if (!AR.DT.dominates(I, EB->getTerminator())) {
+                      dominatesAllExits = false;
+                      break;
+                  }
+              }
+
+              if (dominatesAllExits) {
+                  errs() << "    [SAFE - MARKED FOR HOISTING] " << *I << "\n";
+                  HoistedSet.insert(I);
+                  OrderedHoist.push_back(I);
+
+                  // Since I is now invariant, its users might become invariant too
+                  for (User *U : I->users())
+                      if (auto *UI = dyn_cast<Instruction>(U))
+                          if (L.contains(UI->getParent()))
+                              Worklist.push_back(UI);
+              } else {
+                  errs() << "    [UNSAFE] Does not dominate all exits: " << *I << "\n";
+              }
+          }
+      }
+      if (OrderedHoist.empty()) {
+          return PreservedAnalyses::all();
       }
 
-      return changed;
-    }
+      // Hoist in discovered order to preserve dependencies
+      Instruction *PreheaderTerminator = Preheader->getTerminator();
+      for (Instruction *Inst : OrderedHoist) {
+          Inst->moveBefore(PreheaderTerminator);
+      }
 
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-
-      errs() << "=== LICM: " << F.getName() << " ===\n";
-
-      auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-      auto &LI = FAM.getResult<LoopAnalysis>(F);
-
-      bool changed = false;
-
-      // Process all loops (including nested)
-      for (Loop *L : LI)
-        changed |= processLoop(L, DT);
-
-      return changed ? PreservedAnalyses::none()
-                    : PreservedAnalyses::all();
-    }
+      errs() << "--- Successfully hoisted " << OrderedHoist.size() << " instructions. ---\n";
+      return PreservedAnalyses::none();
+  }
   };
 
 } //namespace
@@ -379,7 +510,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
             return true;
           }
           else if (Name == "loop-invariant-code-motion") {
-            FPM.addPass(LICMPass());
+            FPM.addPass(createFunctionToLoopPassAdaptor(MyLICMSafetyPass()));
             return true;
           }
           return false;
