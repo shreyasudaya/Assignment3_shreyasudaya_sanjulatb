@@ -46,87 +46,85 @@ namespace {
     OS << " }\n";
   }
 
-  
-  struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
-      // 1. Map each BasicBlock to an index for BitVector operations
+  class MyDomTree {
+    DenseMap<BasicBlock*, BasicBlock*> IDoms;
+
+  public:
+    // The logic we already wrote, moved here
+    void build(Function &F) {
       std::vector<BasicBlock*> blocks;
-      DenseMap<BasicBlock *, unsigned> blockIndices;
+      DenseMap<BasicBlock*, unsigned> blockIndices;
       for (BasicBlock &BB : F) {
         blockIndices[&BB] = blocks.size();
         blocks.push_back(&BB);
       }
-
       unsigned N = blocks.size();
-      if (N == 0) return PreservedAnalyses::all();
+      if (N == 0) return;
 
-      // 2. Initialization: 
-      // Dom(Entry) = {Entry}, Dom(Others) = {All Nodes}
       std::vector<BitVector> doms(N, BitVector(N, true));
-      doms[0].reset();
-      doms[0].set(0);
+      doms[0].reset(); doms[0].set(0);
 
-      // 3. Iterative Data-Flow Analysis
       bool changed = true;
       while (changed) {
         changed = false;
         for (unsigned i = 1; i < N; ++i) {
           BitVector newDoms(N, true);
           bool hasPreds = false;
-
           for (auto *pred : predecessors(blocks[i])) {
-            newDoms &= doms[blockIndices[pred]];
-            hasPreds = true;
-          }
-
-          // If a block is unreachable, it only dominates itself
-          if (!hasPreds) newDoms.reset();
-          newDoms.set(i);
-
-          if (newDoms != doms[i]) {
-            doms[i] = newDoms;
-            changed = true;
-          }
-        }
-      }
-
-      // 4. Calculate and Print Immediate Dominators (IDoms)
-      errs() << "\n*** Dominator Tree for Function: " << F.getName() << " ***\n";
-
-      for (unsigned i = 0; i < N; ++i) {
-        std::string idomName = "None (Entry)";
-        
-        // Find the strict dominator that is "closest" to block i
-        for (unsigned d = 0; d < N; ++d) {
-          // d must be a strict dominator of i
-          if (d == i || !doms[i].test(d)) continue;
-
-          bool isImmediate = true;
-          for (unsigned s = 0; s < N; ++s) {
-            // If there's another strict dominator 's' that 'd' dominates,
-            // then 's' is closer to 'i' than 'd' is.
-            if (s == i || s == d || !doms[i].test(s)) continue;
-            if (doms[s].test(d)) {
-              isImmediate = false;
-              break;
+            if (blockIndices.count(pred)) {
+              newDoms &= doms[blockIndices[pred]];
+              hasPreds = true;
             }
           }
-
-          if (isImmediate) {
-            idomName = getShortValueName(blocks[d]);
-            break;
-          }
+          if (!hasPreds) newDoms.reset();
+          newDoms.set(i);
+          if (newDoms != doms[i]) { doms[i] = newDoms; changed = true; }
         }
-        
-        errs() << "Block " << getShortValueName(blocks[i]) 
-              << " -> Immediate Dominator: " << idomName << "\n";
       }
-      errs() << "******************************************\n\n";
 
+      IDoms[blocks[0]] = blocks[0];
+      for (unsigned i = 1; i < N; ++i) {
+        for (unsigned d = 0; d < N; ++d) {
+          if (d == i || !doms[i].test(d)) continue;
+          bool isImmediate = true;
+          for (unsigned s = 0; s < N; ++s) {
+            if (s == i || s == d || !doms[i].test(s)) continue;
+            if (doms[s].test(d)) { isImmediate = false; break; }
+          }
+          if (isImmediate) { IDoms[blocks[i]] = blocks[d]; break; }
+        }
+      }
+    }
+
+    bool dominates(BasicBlock *A, BasicBlock *B) {
+      if (A == B) return true;
+      BasicBlock *Curr = B;
+      while (IDoms.count(Curr) && IDoms[Curr] != Curr) {
+        Curr = IDoms[Curr];
+        if (Curr == A) return true;
+      }
+      return false;
+    }
+    
+    BasicBlock* getIDom(BasicBlock *BB) { return IDoms.lookup(BB); }
+  };  
+
+  struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
+    PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+      MyDomTree DT;
+      DT.build(F); // Run calculation
+      
+      errs() << "Dominator Tree for " << F.getName() << "\n";
+      for (BasicBlock &BB : F) {
+        BasicBlock *IDom = DT.getIDom(&BB);
+        std::string name = (IDom == &BB) ? "None (Root)" : getShortValueName(IDom);
+        errs() << "Block " << getShortValueName(&BB) << " -> IDom: " << name << "\n";
+      }
       return PreservedAnalyses::all();
     }
   };
-  
+
+
   struct DCEPass : PassInfoMixin<DCEPass> {
     //Liveness conditions
     static bool isLive(const Instruction* I) {
