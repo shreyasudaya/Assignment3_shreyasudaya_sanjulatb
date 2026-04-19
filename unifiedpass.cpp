@@ -391,27 +391,10 @@ namespace {
           
           OrigPHI->removeIncomingValue(Latch, false);
         }
-
-        // 6. Final Analysis Update
-        // 6. Final Analysis Update
-        Loop *ParentLoop = L.getParentLoop();
-
-        // 6a. OrigHeader is now the loop guard. It belongs outside this loop.
+        
         L.removeBlockFromLoop(OrigHeader);
-        AR.LI.changeLoopFor(OrigHeader, ParentLoop);
-
-        // 6b. LandingPad is essentially the new preheader. It belongs outside.
-        // (Do NOT add it to &L)
-        AR.LI.changeLoopFor(LandingPad, ParentLoop);
-
-        // 6c. CondBlock is the new latch. It belongs inside the loop.
-        L.addBasicBlockToLoop(CondBlock, AR.LI);
-
-        // 6d. Officially move the loop's entry point to the rotated body.
+        L.addBasicBlockToLoop(CondBlock,AR.LI);
         L.moveToHeader(LoopBodySucc);
-
-        // 6e. Recalculate Dominator Tree
-        AR.DT.recalculate(*F);
     }
     
     PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
@@ -420,7 +403,7 @@ namespace {
       Function *F = L.getHeader()->getParent();
       
       // 1. Rotate the loop (Using the fixed logic from the previous step)
-      rotateLoop(L, AR);
+      rotateLoop(L,AR);
 
       BasicBlock *Preheader = L.getLoopPreheader();
       if (!Preheader) {
