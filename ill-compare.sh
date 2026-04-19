@@ -1,11 +1,13 @@
 #!/bin/bash
 
-# Target directory based on your screenshot
-TARGET_DIR="build/tests/loop-invariant-code-motion"
+# Use first argument as target directory, default to current directory if empty
+TARGET_DIR="${1:-.}"
 
-# Fallback to current directory if target doesn't exist
+# Check if the provided path is actually a directory
 if [ ! -d "$TARGET_DIR" ]; then
-    TARGET_DIR="."
+    echo "Error: '$TARGET_DIR' is not a valid directory."
+    echo "Usage: $0 [path/to/bitcode/files]"
+    exit 1
 fi
 
 echo "================================================================"
