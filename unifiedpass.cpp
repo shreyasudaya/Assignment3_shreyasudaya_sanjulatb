@@ -343,9 +343,10 @@ namespace {
   }
 
   struct MyLICMSafetyPass : PassInfoMixin<MyLICMSafetyPass> {
-    // Logic from before to check if operands are outside the loop
+    // TWEAK: Explicitly ignore PHI nodes to prevent breaking SSA form during hoisting
     bool isInstructionInvariant(Instruction &I, Loop &L) {
-      if (I.getType()->isVoidTy() || I.isTerminator()) return false;
+      if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
+          return false; 
       for (Value *Op : I.operands()) {
         if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
         if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
@@ -357,48 +358,166 @@ namespace {
       return true;
     }
 
-    PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
-                          LoopStandardAnalysisResults &AR, LPMUpdater &U) {
-      
-      DominatorTree &DT = AR.DT;
-      errs() << "\n--- Analyzing Loop: " << L.getHeader()->getName() << " ---\n";
 
-      // 1. Get and print all Exit Blocks
+    void rotateLoop(Loop &L, LoopStandardAnalysisResults &AR) {
+        BasicBlock *OrigHeader = L.getHeader();
+        BasicBlock *Latch      = L.getLoopLatch();
+        BasicBlock *Preheader  = L.getLoopPreheader();
+        Function   *F          = OrigHeader->getParent();
+        LLVMContext &Ctx       = F->getContext();
+
+        // 1. Create the new blocks
+        BasicBlock *LandingPad = BasicBlock::Create(Ctx, "loop.landing", F, OrigHeader);
+        BasicBlock *CondBlock  = BasicBlock::Create(Ctx, "loop.cond", F);
+
+        auto *OrigTerm = cast<BranchInst>(OrigHeader->getTerminator());
+        BasicBlock *LoopBodySucc = OrigTerm->getSuccessor(0);
+        BasicBlock *ExitBlock    = OrigTerm->getSuccessor(1);
+        if (!L.contains(LoopBodySucc)) std::swap(LoopBodySucc, ExitBlock);
+
+        // 2. Map original PHIs to their initial values BEFORE replacement
+        DenseMap<PHINode*, Value*> PhiToInitMap;
+        std::vector<PHINode*> PHIs;
+        for (PHINode &PN : OrigHeader->phis()) {
+            PHIs.push_back(&PN);
+            PhiToInitMap[&PN] = PN.getIncomingValueForBlock(Preheader);
+        }
+
+        // 3. Clone condition for the new Latch (CondBlock)
+        Value *Cond = OrigTerm->getCondition();
+        if (auto *CondInst = dyn_cast<Instruction>(Cond)) {
+            if (CondInst->getParent() == OrigHeader) {
+                Instruction *Cloned = CondInst->clone();
+                Cloned->insertInto(CondBlock, CondBlock->end());
+                Cond = Cloned;
+            }
+        }
+
+        // 4. Setup Branch Logic
+        BranchInst::Create(LandingPad, ExitBlock, OrigTerm->getCondition(), OrigHeader);
+        OrigTerm->eraseFromParent();
+        BranchInst::Create(LoopBodySucc, LandingPad);
+        BranchInst::Create(LoopBodySucc, ExitBlock, Cond, CondBlock);
+        CondBlock->moveAfter(Latch);
+        Latch->getTerminator()->replaceSuccessorWith(OrigHeader, CondBlock);
+
+        // 5. Create Rotated PHIs and update LCSSA
+        for (PHINode *OrigPHI : PHIs) {
+          Value *InitVal = PhiToInitMap[OrigPHI];
+          Value *LoopVal = OrigPHI->getIncomingValueForBlock(Latch);
+
+          PHINode *NewPHI = PHINode::Create(OrigPHI->getType(), 2, OrigPHI->getName() + ".rot", 
+                                            LoopBodySucc->getFirstNonPHI());
+          NewPHI->addIncoming(InitVal, LandingPad);
+          NewPHI->addIncoming(LoopVal, CondBlock);
+
+          // Update LCSSA PHIs in ExitBlock specifically
+          for (PHINode &ExitPHI : ExitBlock->phis()) {
+              for (unsigned i = 0; i < ExitPHI.getNumIncomingValues(); ++i) {
+                  if (ExitPHI.getIncomingValue(i) == OrigPHI && ExitPHI.getIncomingBlock(i) == OrigHeader) {
+                      // Path from Guard: Use Initial Value
+                      ExitPHI.setIncomingValue(i, InitVal); 
+                      // Path from New Latch: Use Loop Value (the Rotated PHI)
+                      ExitPHI.addIncoming(NewPHI, CondBlock);
+                  }
+              }
+          }
+
+          // Update all other users (excluding the Guard block)
+          OrigPHI->replaceUsesWithIf(NewPHI, [OrigHeader](Use &U) {
+              if (auto *UI = dyn_cast<Instruction>(U.getUser()))
+                  return UI->getParent() != OrigHeader;
+              return true;
+          });
+
+          
+          OrigPHI->removeIncomingValue(Latch, false);
+        }
+
+        // 6. Final Analysis Update
+        // 6. Final Analysis Update
+        Loop *ParentLoop = L.getParentLoop();
+
+        // 6a. OrigHeader is now the loop guard. It belongs outside this loop.
+        L.removeBlockFromLoop(OrigHeader);
+        AR.LI.changeLoopFor(OrigHeader, ParentLoop);
+
+        // 6b. LandingPad is essentially the new preheader. It belongs outside.
+        // (Do NOT add it to &L)
+        AR.LI.changeLoopFor(LandingPad, ParentLoop);
+
+        // 6c. CondBlock is the new latch. It belongs inside the loop.
+        L.addBasicBlockToLoop(CondBlock, AR.LI);
+
+        // 6d. Officially move the loop's entry point to the rotated body.
+        L.moveToHeader(LoopBodySucc);
+
+        // 6e. Recalculate Dominator Tree
+        AR.DT.recalculate(*F);
+    }
+    
+    PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
+                         LoopStandardAnalysisResults &AR, LPMUpdater &U) {
+        
+      Function *F = L.getHeader()->getParent();
+      
+      // 1. Rotate the loop (Using the fixed logic from the previous step)
+      rotateLoop(L, AR);
+
+      // 2. Get the preheader. If it doesn't exist, we have nowhere to hoist to!
+      BasicBlock *Preheader = L.getLoopPreheader();
+      if (!Preheader) {
+          errs() << "Skipping: No preheader available for hoisting.\n";
+          return PreservedAnalyses::all();
+      }
+
       SmallVector<BasicBlock *, 4> ExitingBlocks;
       L.getExitingBlocks(ExitingBlocks);
-      
-      errs() << "  Exiting Blocks: ";
-      for (BasicBlock *EB : ExitingBlocks) {
-        errs() << EB->getName() << " ";
-      }
-      errs() << "\n";
 
-      // 2. Iterate through blocks and instructions
+      // 3. Create a worklist to avoid iterator invalidation
+      SmallVector<Instruction *, 16> InstructionsToHoist;
+
+      errs() << "\n--- Analyzing Rotated Loop: " << L.getHeader()->getName() << " ---\n";
+
+      // 4. Identify safe instructions
       for (BasicBlock *BB : L.getBlocks()) {
-        for (Instruction &I : *BB) {
-          
-          if (isInstructionInvariant(I, L)) {
-            errs() << "  Found Invariant: " << I << "\n";
+          for (Instruction &I : *BB) {
+              if (isInstructionInvariant(I, L)) {
+                  
+                  bool dominatesAllExits = true;
+                  for (BasicBlock *EB : ExitingBlocks) {
+                      if (!AR.DT.dominates(&I, EB->getTerminator())) {
+                          dominatesAllExits = false;
+                          break;
+                      }
+                  }
 
-            // 3. Check if the instruction's block dominates ALL exiting blocks
-            bool dominatesAllExits = true;
-            for (BasicBlock *EB : ExitingBlocks) {
-              if (!DT.dominates(BB, EB)) {
-                dominatesAllExits = false;
-                break;
+                  if (dominatesAllExits) {
+                      errs() << "    [SAFE - MARKED FOR HOISTING] " << I << "\n";
+                      InstructionsToHoist.push_back(&I);
+                  } else {
+                      errs() << "    [UNSAFE] Does not dominate all exits: " << I << "\n";
+                  }
               }
-            }
-
-            if (dominatesAllExits) {
-              errs() << "    [SAFE] Dominates all exiting blocks. Can be hoisted.\n";
-            } else {
-              errs() << "    [UNSAFE] Does not dominate all exiting blocks. Hoisting might change program behavior.\n";
-            }
           }
-        }
       }
 
-      return PreservedAnalyses::all();
+      // 5. Hoist the instructions!
+      if (InstructionsToHoist.empty()) {
+          return PreservedAnalyses::all(); // Nothing changed
+      }
+
+      Instruction *PreheaderTerminator = Preheader->getTerminator();
+      for (Instruction *Inst : InstructionsToHoist) {
+          // Physically move the instruction from the loop body to the preheader
+          Inst->moveBefore(PreheaderTerminator);
+      }
+
+      errs() << "--- Successfully hoisted " << InstructionsToHoist.size() << " instructions. ---\n";
+
+      // The CFG hasn't changed since rotation, but we moved instructions.
+      // Depending on your LLVM version, PreservedAnalyses::none() is the safest bet.
+      return PreservedAnalyses::none();
     }
   };
 } //namespace
