@@ -3,7 +3,6 @@
 #include <string>
 #include <vector>
 
-#include "llvm/IR/Dominators.h"
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
@@ -33,21 +32,7 @@ namespace {
     return S;
   }
 
-  template <typename T>
-  void printBitSet(raw_ostream& OS, StringRef label, const BitVector& bits,
-                  const std::vector<T>& universe) {
-    OS << "  " << label << ": { ";
-    bool first = true;
-    for (unsigned i = 0; i < bits.size(); ++i) {
-      if (!bits.test(i)) continue;
-      if (!first) OS << "; ";
-      first = false;
-      OS << getShortValueName(universe[i]); 
-    }
-    OS << " }\n";
-  }
-
-  class MyDomTree {
+  class Dominator_Tree {
     DenseMap<BasicBlock*, BasicBlock*> IDoms;
 
   public:
@@ -112,7 +97,7 @@ namespace {
 
   struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
-      MyDomTree DT;
+      Dominator_Tree DT;
       DT.build(F); // Run calculation
       
       errs() << "Dominator Tree for " << F.getName() << "\n";
@@ -371,7 +356,7 @@ namespace {
           }
           
           PHINode *NewPHI = PHINode::Create(OrigPHI->getType(), 2, OrigPHI->getName() + ".rot", 
-                                            LoopBodySucc->getFirstNonPHI());
+                                            LoopBodySucc->getFirstNonPHIIt());
           NewPHI->addIncoming(InitVal, LandingPad);
           NewPHI->addIncoming(LoopVal, CondBlock);
 
@@ -432,6 +417,9 @@ namespace {
           for (Instruction &I : *BB)
               Worklist.push_back(&I);
 
+      Dominator_Tree DT;
+      DT.build(*F);
+
       // Iteratively process the worklist
       while (!Worklist.empty()) {
           Instruction *I = Worklist.pop_back_val();
@@ -442,9 +430,6 @@ namespace {
           // TWEAK: Pass HoistedSet to check if operands are "effectively" invariant
           if (isInstructionInvariant(*I, L, HoistedSet)) {
               
-              MyDomTree DT;
-              DT.build(*F);
-
               bool dominatesAllExits = true;
               BasicBlock *InstBB = I->getParent();
               for (BasicBlock *EB : ExitingBlocks) {
@@ -475,8 +460,9 @@ namespace {
 
       // Hoist in discovered order to preserve dependencies
       Instruction *PreheaderTerminator = Preheader->getTerminator();
+      auto InsertPos = PreheaderTerminator->getIterator();
       for (Instruction *Inst : OrderedHoist) {
-          Inst->moveBefore(PreheaderTerminator);
+          Inst->moveBefore(InsertPos);
       }
 
       errs() << "--- Successfully hoisted " << OrderedHoist.size() << " instructions. ---\n";
@@ -554,16 +540,16 @@ namespace {
             for (Instruction &I : *BB)
                 Worklist.push_back(&I);
 
+        // Re-build and use your custom Dominator_Tree
+        Dominator_Tree DT;
+        DT.build(*F);
+
         while (!Worklist.empty()) {
             Instruction *I = Worklist.pop_back_val();
             if (HoistedSet.count(I)) continue;
 
-            // Use the Relaxed Invariance Rule + your custom MyDomTree
+            // Use the Relaxed Invariance Rule + your custom Dominator Tree logic
             if (isAggressiveInvariant(*I, L, HoistedSet, MemoryWriters, AR.AA)) {
-                
-                // Re-build and use your custom MyDomTree
-                MyDomTree DT;
-                DT.build(*F);
 
                 SmallVector<BasicBlock *, 4> ExitingBlocks;
                 L.getExitingBlocks(ExitingBlocks);
@@ -592,8 +578,9 @@ namespace {
         if (OrderedHoist.empty()) return PreservedAnalyses::all();
 
         Instruction *PreheaderTerminator = Preheader->getTerminator();
+        auto InsertPos = PreheaderTerminator->getIterator();
         for (Instruction *Inst : OrderedHoist) {
-            Inst->moveBefore(PreheaderTerminator);
+            Inst->moveBefore(InsertPos);
         }
 
         return PreservedAnalyses::none();
