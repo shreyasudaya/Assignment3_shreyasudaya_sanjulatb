@@ -519,7 +519,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
     [](PassBuilder& PB) {
       PB.registerPipelineParsingCallback(
         [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "dominator") {
+          if (Name == "dominators") {
             FPM.addPass(DominatorAnalysis());
             return true;
           } 
@@ -527,7 +527,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
             FPM.addPass(DCEPass());
             return true;
           }
-          else if (Name == "licm-assignment") {
+          else if (Name == "loop-invariant-code-motion") {
             FPM.addPass(LICMPass());
             return true;
           }
