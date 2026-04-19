@@ -49,97 +49,79 @@ namespace {
   
   struct DominatorAnalysis : public PassInfoMixin<DominatorAnalysis> {
     PreservedAnalyses run(Function& F, FunctionAnalysisManager&) {
+      // 1. Map each BasicBlock to an index for BitVector operations
+      std::vector<BasicBlock*> blocks;
+      DenseMap<BasicBlock *, unsigned> blockIndices;
+      for (BasicBlock &BB : F) {
+        blockIndices[&BB] = blocks.size();
+        blocks.push_back(&BB);
+      }
 
-      //DFS NUMBERING
-      std::vector<BasicBlock*> vertex;
-      DenseMap<BasicBlock*, int> index;
+      unsigned N = blocks.size();
+      if (N == 0) return PreservedAnalyses::all();
 
-      std::vector<int> parent;
-      int N = 0;
+      // 2. Initialization: 
+      // Dom(Entry) = {Entry}, Dom(Others) = {All Nodes}
+      std::vector<BitVector> doms(N, BitVector(N, true));
+      doms[0].reset();
+      doms[0].set(0);
 
-      std::function<void(BasicBlock*)> dfs = [&](BasicBlock* v) {
-        index[v] = N++;
-        vertex.push_back(v);
-        parent.push_back(-1);
+      // 3. Iterative Data-Flow Analysis
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        for (unsigned i = 1; i < N; ++i) {
+          BitVector newDoms(N, true);
+          bool hasPreds = false;
 
-        for (auto* succ : successors(v)) {
-          if (!index.count(succ)) {
-            parent.push_back(index[v]); 
-            dfs(succ);
-            parent[index[succ]] = index[v];
+          for (auto *pred : predecessors(blocks[i])) {
+            newDoms &= doms[blockIndices[pred]];
+            hasPreds = true;
+          }
+
+          // If a block is unreachable, it only dominates itself
+          if (!hasPreds) newDoms.reset();
+          newDoms.set(i);
+
+          if (newDoms != doms[i]) {
+            doms[i] = newDoms;
+            changed = true;
           }
         }
-      };
-
-      BasicBlock* entry = &F.getEntryBlock();
-      dfs(entry);
-
-      // Resize arrays
-      std::vector<int> semi(N), idom(N, -1), ancestor(N, -1), label(N);
-      std::vector<std::vector<int>> bucket(N);
-
-      for (int i = 0; i < N; ++i) {
-        semi[i] = i;
-        label[i] = i;
       }
 
-      //Union helpers
-      std::function<void(int)> compress = [&](int v) {
-        if (ancestor[ancestor[v]] != -1) {
-          compress(ancestor[v]);
-          if (semi[label[ancestor[v]]] < semi[label[v]])
-            label[v] = label[ancestor[v]];
-          ancestor[v] = ancestor[ancestor[v]];
+      // 4. Calculate and Print Immediate Dominators (IDoms)
+      errs() << "\n*** Dominator Tree for Function: " << F.getName() << " ***\n";
+
+      for (unsigned i = 0; i < N; ++i) {
+        std::string idomName = "None (Entry)";
+        
+        // Find the strict dominator that is "closest" to block i
+        for (unsigned d = 0; d < N; ++d) {
+          // d must be a strict dominator of i
+          if (d == i || !doms[i].test(d)) continue;
+
+          bool isImmediate = true;
+          for (unsigned s = 0; s < N; ++s) {
+            // If there's another strict dominator 's' that 'd' dominates,
+            // then 's' is closer to 'i' than 'd' is.
+            if (s == i || s == d || !doms[i].test(s)) continue;
+            if (doms[s].test(d)) {
+              isImmediate = false;
+              break;
+            }
+          }
+
+          if (isImmediate) {
+            idomName = getShortValueName(blocks[d]);
+            break;
+          }
         }
-      };
-
-      std::function<int(int)> eval = [&](int v) -> int {
-        if (ancestor[v] == -1)
-          return label[v];
-        compress(v);
-        return label[v];
-      };
-
-      auto link = [&](int v, int w) {
-        ancestor[w] = v;
-      };
-
-      //Lengar-Tarjan Algorithm
-      for (int w = N - 1; w > 0; --w) {
-        BasicBlock* BB = vertex[w];
-
-        //Compute semi-dominator
-        for (auto* pred : predecessors(BB)) {
-          if (!index.count(pred)) continue;
-          int v = index[pred];
-          int u = eval(v);
-          semi[w] = std::min(semi[w], semi[u]);
-        }
-
-        bucket[semi[w]].push_back(w);
-        link(parent[w], w);
-
-        //Process Bucket
-        for (int v : bucket[parent[w]]) {
-          int u = eval(v);
-          if (semi[u] < semi[v])
-            idom[v] = u;
-          else
-            idom[v] = parent[w];
-        }
+        
+        errs() << "Block " << getShortValueName(blocks[i]) 
+              << " -> Immediate Dominator: " << idomName << "\n";
       }
-
-      //Finalize idominators
-      for (int i = 1; i < N; ++i) {
-        if (idom[i] != semi[i])
-          idom[i] = idom[idom[i]];
-      }
-
-      for (int i = 1; i < N; ++i) {
-        errs() << "Block " << getShortValueName(vertex[i])
-              << " is dominated by "
-              << getShortValueName(vertex[idom[i]]) << "\n";
-      }
+      errs() << "******************************************\n\n";
 
       return PreservedAnalyses::all();
     }
