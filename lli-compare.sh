@@ -10,9 +10,9 @@ if [ ! -d "$TARGET_DIR" ]; then
     exit 1
 fi
 
-echo "================================================================"
-printf "%-20s | %-10s | %-10s | %-10s\n" "Bitcode Pair" "m2r" "opt" "Diff"
-echo "================================================================"
+echo "======================================================================="
+printf "%-20s | %-10s | %-10s | %-15s\n" "Bitcode Pair" "m2r" "opt" "Diff (%)"
+echo "======================================================================="
 
 # Find all files ending in -m2r.bc
 find "$TARGET_DIR" -maxdepth 1 -name "*-m2r.bc" | sort | while read -r base_bc; do
@@ -45,14 +45,22 @@ find "$TARGET_DIR" -maxdepth 1 -name "*-m2r.bc" | sort | while read -r base_bc; 
     # Calculate difference (positive means opt is better/smaller)
     diff=$((m2r_count - opt_count))
 
-    # Colorize the output: Red if opt is higher (your current issue), Green if lower
+    # Calculate percentage using awk for float precision, avoiding divide-by-zero
+    if [ "$m2r_count" -gt 0 ] && [ "$diff" -gt 0 ]; then
+        percent=$(awk "BEGIN {printf \"%.2f\", ($diff / $m2r_count) * 100}")
+        diff_display="${diff} (+${percent}%)"
+    else
+        diff_display="${diff}"
+    fi
+
+    # Colorize the output: Red if opt is higher (regression), Green if lower
     if [ "$diff" -lt 0 ]; then
         # Red text for regression
-        printf "%-20s | %-10s | %-10s | \e[31m%10s\e[0m\n" "$display_name" "$m2r_count" "$opt_count" "$diff"
+        printf "%-20s | %-10s | %-10s | \e[31m%15s\e[0m\n" "$display_name" "$m2r_count" "$opt_count" "$diff_display"
     else
         # Green text for improvement
-        printf "%-20s | %-10s | %-10s | \e[32m%10s\e[0m\n" "$display_name" "$m2r_count" "$opt_count" "$diff"
+        printf "%-20s | %-10s | %-10s | \e[32m%15s\e[0m\n" "$display_name" "$m2r_count" "$opt_count" "$diff_display"
     fi
 done
 
-echo "================================================================"
+echo "======================================================================="
