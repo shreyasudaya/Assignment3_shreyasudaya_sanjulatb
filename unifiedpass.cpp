@@ -189,9 +189,7 @@ namespace {
             //FaintOut_n = Intersection of FaintIn of successors
             BitVector newFaintOut(universe.size(), true);
             if (&I == &BB.back()) {
-              if (succ_empty(&BB)) {
-                // newFaintOut.reset(); // Function exit: values are NOT faint (useful)
-              } else {
+              if (!succ_empty(&BB)) {
                 for (BasicBlock* succ : successors(&BB)) {
                   newFaintOut &= faintIn[&succ->front()];
                 }
@@ -226,15 +224,14 @@ namespace {
             FaintGen.reset(Rhs); 
 
             //FaintKill = {Rhs if Lhs is useful} U Use
-            BitVector FaintKill = Use;
-            bool lhsIsUseful = false;
-            for (int i : Lhs.set_bits()) {
-              if (!faintOut[&I].test(i)) { // Not faint in Out set means useful
-                lhsIsUseful = true;
+            BitVector FaintKill(universe.size(), false);
+            for (int lhsIdx : Lhs.set_bits()) {
+              if (!faintOut[&I].test(lhsIdx)) { // This Lhs var is NOT faint (is useful)
+                FaintKill |= Rhs;               // Kill all Rhs vars
                 break;
               }
             }
-            if (lhsIsUseful) FaintKill |= Rhs;
+            FaintKill |= Use;
 
             //FaintIn = (FaintOut - FaintKill) U FaintGen
             BitVector newFaintIn = faintOut[&I];
@@ -251,14 +248,10 @@ namespace {
 
       //Print 
       errs() << "=== " << F.getName() << " ===\n";
-      for (auto& BB : F) {
-        errs() << "BB: " << getShortValueName(&BB) << "\n";
-        printBitSet(errs(), "faintIn", faintIn[&BB.front()], universe);
-        printBitSet(errs(), "faintOut", faintOut[&BB.back()], universe);
-      }
 
       //Eliminate Instructions
       std::vector<Instruction*> toRemove;
+      printf("Instructions that can be deleted:\n");
       for (auto& BB : F) {
         for (auto& I : BB) {
           if (!isLive(&I) && instIdxMap.count(&I)) {
@@ -266,6 +259,7 @@ namespace {
             //Assignment is dead if its result is faint at the exit of the instruction
             if (faintOut[&I].test(idx)) {
               toRemove.push_back(&I);
+              errs() << I << "\n";     // Prints instruction details
             }
           }
         }
