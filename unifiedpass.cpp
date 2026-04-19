@@ -341,40 +341,52 @@ namespace {
       return true; // All operands passed the checks
   }
 
-  struct MyLoopOperandAnalysis : PassInfoMixin<MyLoopOperandAnalysis> {
+  struct MyInvariantAnalysis : PassInfoMixin<MyInvariantAnalysis> {
+  
+    // Helper to determine if a specific instruction is loop-invariant
+    bool isInstructionInvariant(Instruction &I, Loop &L) {
+      // A void instruction (like a store or call) usually shouldn't be 
+      // marked invariant based purely on operands.
+      if (I.getType()->isVoidTy()) return false;
+
+      for (Value *Op : I.operands()) {
+        // 1. If it's a Constant, it's invariant.
+        if (isa<Constant>(Op)) continue;
+
+        // 2. If it's a Function Argument, it's invariant.
+        if (isa<Argument>(Op)) continue;
+
+        // 3. If it's an Instruction, check its location.
+        if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+          if (L.contains(OpInst->getParent())) {
+            // If even one operand is defined inside, the whole instruction is NOT invariant.
+            return false;
+          }
+          continue;
+        }
+
+        // If we encounter something else (like inline asm), assume not invariant.
+        return false;
+      }
+
+      return true;
+    }
+
     PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
                           LoopStandardAnalysisResults &AR, LPMUpdater &U) {
       
-      errs() << "\n--- Analyzing Loop Header: " << L.getHeader()->getName() << " ---\n";
+      errs() << "\n--- Checking Invariance in Loop: " << L.getHeader()->getName() << " ---\n";
 
-      // 1. Iterate over every Basic Block assigned to this loop
       for (BasicBlock *BB : L.getBlocks()) {
-        errs() << "  Block: " << BB->getName() << "\n";
-
-        // 2. Iterate over every Instruction in the block
         for (Instruction &I : *BB) {
-          errs() << "    Instruction: " << I << "\n";
-
-          // 3. Check each Operand (Use) of the instruction
-          for (Value *Op : I.operands()) {
-            
-            // We only care about operands defined by other instructions
-            // (Ignores Constants, Function Arguments, and Inline Assembly)
-            if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
-              
-              errs() << "      Operand: ";
-              OpInst->printAsOperand(errs(), false);
-
-              // 4. Use Loop::contains to check if the definition is inside the loop
-              if (L.contains(OpInst->getParent())) {
-                errs() << " [Defined INSIDE loop]\n";
-              } else {
-                errs() << " [Defined OUTSIDE loop (Invariant/External)]\n";
-              }
-            } else if (isa<Argument>(Op)) {
-              errs() << "      Operand: ";
-              Op->printAsOperand(errs(), false);
-              errs() << " [Defined OUTSIDE loop (Function Argument)]\n";
+          
+          if (isInstructionInvariant(I, L)) {
+            errs() << "  [INVARIANT] ";
+            errs() << I << "\n";
+          } else {
+            // Optional: Print why it's variant if it's not a terminator/void
+            if (!I.getType()->isVoidTy() && !I.isTerminator()) {
+              // errs() << "  [VARIANT]   " << I << "\n";
             }
           }
         }
@@ -400,7 +412,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
             return true;
           }
           else if (Name == "loop-invariant-code-motion") {
-            FPM.addPass(createFunctionToLoopPassAdaptor(MyLoopOperandAnalysis()));
+            FPM.addPass(createFunctionToLoopPassAdaptor(MyInvariantAnalysis()));
             return true;
           }
           return false;
