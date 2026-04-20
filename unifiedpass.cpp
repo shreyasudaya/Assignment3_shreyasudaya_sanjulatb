@@ -249,7 +249,7 @@ namespace {
     }
   };
 
-  struct MyLICMSafetyPass : PassInfoMixin<MyLICMSafetyPass> {
+  struct LICMSafePass : PassInfoMixin<LICMSafePass> {
     
     bool isInstructionInvariant(Instruction &I, Loop &L, const DenseSet<Instruction*> &HoistedSet) {
       if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
@@ -502,7 +502,7 @@ namespace {
         Function *F = L.getHeader()->getParent();
         
         // 1. Reuse your existing rotation logic
-        MyLICMSafetyPass helper; 
+        LICMSafePass helper; 
         helper.rotateLoop(L, AR);
 
         BasicBlock *Preheader = L.getLoopPreheader();
@@ -588,7 +588,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
             return true;
           }
           else if (Name == "loop-invariant-code-motion") {
-            FPM.addPass(createFunctionToLoopPassAdaptor(MyLICMSafetyPass()));
+            FPM.addPass(createFunctionToLoopPassAdaptor(LICMSafePass()));
             return true;
           }
           else if (Name == "aggressive-licm") {
