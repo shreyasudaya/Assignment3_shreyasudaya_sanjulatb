@@ -455,31 +455,36 @@ namespace {
   };
 
   struct AggressiveLICMPass : PassInfoMixin<AggressiveLICMPass> {
-    bool isAggressiveInvariant(Instruction &I, Loop &L, const DenseSet<Instruction*> &HoistedSet, 
-                               bool loopModifiesMemory) {
-      if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
+    bool isInstructionInvariant(Instruction &I, Loop &L,
+                                const DenseSet<Instruction *> &HoistedSet,
+                                bool AllowLoads) {
+      if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I))
         return false;
-      if (I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
-        return false;
-      // Relaxed Rule for Loads
+
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
-        // If the loop contains ANY memory modification, we cannot safely hoist loads with this rule
-        if (loopModifiesMemory)
+        // Only hoist loads if the loop has no stores at all
+        if (!AllowLoads)
           return false;
+        if (LI->isVolatile() || !LI->isSimple())
+          return false;
+
+        // Pointer operand must be invariant
         Value *Ptr = LI->getPointerOperand();
-        // The pointer itself must still be loop-invariant
-        if (L.contains(dyn_cast_or_null<Instruction>(Ptr)) && !HoistedSet.count(dyn_cast<Instruction>(Ptr)))
+        if (auto *PtrInst = dyn_cast<Instruction>(Ptr))
+          if (L.contains(PtrInst->getParent()) && !HoistedSet.count(PtrInst))
+            return false;
+
+        return true;
+
+      } else {
+        if (I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
           return false;
-      } else if (I.mayReadFromMemory()) {
-        // Other memory-reading instructions (like calls) remain restricted
-        return false; 
       }
 
-      // Standard operand check for all other instructions
       for (Value *Op : I.operands()) {
         if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
         if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
-          if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst)) 
+          if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst))
             return false;
           continue;
         }
@@ -490,35 +495,41 @@ namespace {
 
     PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
                           LoopStandardAnalysisResults &AR, LPMUpdater &U) {
-        
+
       Function *F = L.getHeader()->getParent();
-      
-      //rotateLoop from safe LICM
-      LICMSafePass helper; 
+
+      // Check for stores BEFORE rotation mutates the loop
+      bool HasStore = false;
+      for (BasicBlock *BB : L.getBlocks())
+        for (Instruction &I : *BB)
+          if (isa<StoreInst>(&I)) { HasStore = true; break; }
+
+      bool AllowLoads = !HasStore;
+
+      LICMSafePass helper;
       helper.rotateLoop(L, AR);
 
       BasicBlock *Preheader = L.getLoopPreheader();
-      if (!Preheader) return PreservedAnalyses::all();
-
-      //Check for memory modifications
-      bool loopModifiesMemory = false;
-      for (BasicBlock *BB : L.getBlocks()) {
-        for (Instruction &Inst : *BB) {
-          if (Inst.mayWriteToMemory()) {
-            loopModifiesMemory = true;
-            break; 
-          }
-        }
-        if (loopModifiesMemory) break;
+      if (!Preheader) {
+        errs() << "Skipping: No preheader available for hoisting.\n";
+        return PreservedAnalyses::all();
       }
+
+      SmallVector<BasicBlock *, 4> ExitingBlocks;
+      L.getExitingBlocks(ExitingBlocks);
 
       SmallVector<Instruction *, 16> Worklist;
       DenseSet<Instruction *> HoistedSet;
       SmallVector<Instruction *, 16> OrderedHoist;
 
+      errs() << "\n--- Analyzing Rotated Loop: " << L.getHeader()->getName()
+            << (AllowLoads ? " [store-free: loads eligible]"
+                            : " [has stores: loads blocked]")
+            << " ---\n";
+
       for (BasicBlock *BB : L.getBlocks())
         for (Instruction &I : *BB)
-            Worklist.push_back(&I);
+          Worklist.push_back(&I);
 
       Dominator_Tree DT;
       DT.build(*F);
@@ -527,40 +538,41 @@ namespace {
         Instruction *I = Worklist.pop_back_val();
         if (HoistedSet.count(I)) continue;
 
-        //Pass flag into the invariant check
-        if (isAggressiveInvariant(*I, L, HoistedSet, loopModifiesMemory)) {
-          SmallVector<BasicBlock *, 4> ExitingBlocks;
-          L.getExitingBlocks(ExitingBlocks);
-          
+        if (isInstructionInvariant(*I, L, HoistedSet, AllowLoads)) {
           bool dominatesAllExits = true;
+          BasicBlock *InstBB = I->getParent();
           for (BasicBlock *EB : ExitingBlocks) {
-            if (!DT.dominates(I->getParent(), EB)) {
-                dominatesAllExits = false;
-                break;
+            if (!DT.dominates(InstBB, EB)) {
+              dominatesAllExits = false;
+              break;
             }
           }
 
-          if (dominatesAllExits || isSafeToSpeculativelyExecute(I)) {
-            errs() << "    [AGGRESSIVE HOIST] " << *I << "\n";
+          if (dominatesAllExits) {
+            errs() << "    [SAFE - MARKED FOR HOISTING] " << *I << "\n";
             HoistedSet.insert(I);
             OrderedHoist.push_back(I);
 
             for (User *U : I->users())
-                if (auto *UI = dyn_cast<Instruction>(U))
-                    if (L.contains(UI->getParent()))
-                        Worklist.push_back(UI);
+              if (auto *UI = dyn_cast<Instruction>(U))
+                if (L.contains(UI->getParent()))
+                  Worklist.push_back(UI);
+          } else {
+            errs() << "    [UNSAFE] Does not dominate all exits: " << *I << "\n";
           }
         }
       }
 
-      if (OrderedHoist.empty()) return PreservedAnalyses::all();
+      if (OrderedHoist.empty())
+        return PreservedAnalyses::all();
 
       Instruction *PreheaderTerminator = Preheader->getTerminator();
       auto InsertPos = PreheaderTerminator->getIterator();
-      for (Instruction *Inst : OrderedHoist) {
-          Inst->moveBefore(InsertPos);
-      }
+      for (Instruction *Inst : OrderedHoist)
+        Inst->moveBefore(InsertPos);
 
+      errs() << "--- Successfully hoisted " << OrderedHoist.size()
+            << " instructions. ---\n";
       return PreservedAnalyses::none();
     }
   };
