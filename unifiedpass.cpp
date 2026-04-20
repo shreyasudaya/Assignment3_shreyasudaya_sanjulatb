@@ -455,119 +455,113 @@ namespace {
   };
 
   struct AggressiveLICMPass : PassInfoMixin<AggressiveLICMPass> {
-    
-    // Identical to your standard pass, but allows Loads if they are proved invariant
     bool isAggressiveInvariant(Instruction &I, Loop &L, const DenseSet<Instruction*> &HoistedSet, 
-                               const SmallVectorImpl<Instruction*> &MemoryWriters, AAResults &AA) {
-        
-        if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
+                               bool loopModifiesMemory) {
+      if (I.getType()->isVoidTy() || I.isTerminator() || isa<PHINode>(&I)) 
+        return false;
+      if (I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
+        return false;
+      // Relaxed Rule for Loads
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        // If the loop contains ANY memory modification, we cannot safely hoist loads with this rule
+        if (loopModifiesMemory)
+          return false;
+        Value *Ptr = LI->getPointerOperand();
+        // The pointer itself must still be loop-invariant
+        if (L.contains(dyn_cast_or_null<Instruction>(Ptr)) && !HoistedSet.count(dyn_cast<Instruction>(Ptr)))
+          return false;
+      } else if (I.mayReadFromMemory()) {
+        // Other memory-reading instructions (like calls) remain restricted
+        return false; 
+      }
+
+      // Standard operand check for all other instructions
+      for (Value *Op : I.operands()) {
+        if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
+        if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
+          if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst)) 
             return false;
-
-        // Relaxed Rule: Allow memory reads if we can prove they are invariant
-        if (I.mayHaveSideEffects() || !isSafeToSpeculativelyExecute(&I))
-            return false;
-
-        if (auto *LI = dyn_cast<LoadInst>(&I)) {
-            Value *Ptr = LI->getPointerOperand();
-            // Pointer itself must be invariant
-            if (L.contains(dyn_cast_or_null<Instruction>(Ptr)) && !HoistedSet.count(dyn_cast<Instruction>(Ptr)))
-                return false;
-
-            // Check against all instructions in the loop that might write to memory
-            MemoryLocation Loc = MemoryLocation::get(LI);
-            for (Instruction *W : MemoryWriters) {
-                if (isModSet(AA.getModRefInfo(W, Loc))) 
-                    return false; // Found a potential alias/write, cannot hoist
-            }
-        } else if (I.mayReadFromMemory()) {
-            return false; // Other memory-reading instructions (like calls) remain restricted
+          continue;
         }
-
-        // Standard operand check (same as your original pass)
-        for (Value *Op : I.operands()) {
-            if (isa<Constant>(Op) || isa<Argument>(Op)) continue;
-            if (Instruction *OpInst = dyn_cast<Instruction>(Op)) {
-                if (L.contains(OpInst->getParent()) && !HoistedSet.count(OpInst)) 
-                    return false;
-                continue;
-            }
-            return false;
-        }
-        return true;
+        return false;
+      }
+      return true;
     }
 
     PreservedAnalyses run(Loop &L, LoopAnalysisManager &AM,
                           LoopStandardAnalysisResults &AR, LPMUpdater &U) {
         
-        Function *F = L.getHeader()->getParent();
-        
-        // 1. Reuse your existing rotation logic
-        LICMSafePass helper; 
-        helper.rotateLoop(L, AR);
+      Function *F = L.getHeader()->getParent();
+      
+      //rotateLoop from safe LICM
+      LICMSafePass helper; 
+      helper.rotateLoop(L, AR);
 
-        BasicBlock *Preheader = L.getLoopPreheader();
-        if (!Preheader) return PreservedAnalyses::all();
+      BasicBlock *Preheader = L.getLoopPreheader();
+      if (!Preheader) return PreservedAnalyses::all();
 
-        // 2. Collect all "Writers" once to speed up Alias Analysis checks
-        SmallVector<Instruction *, 16> MemoryWriters;
-        for (BasicBlock *BB : L.getBlocks())
-            for (Instruction &Inst : *BB)
-                if (Inst.mayWriteToMemory())
-                    MemoryWriters.push_back(&Inst);
+      //Check for memory modifications
+      bool loopModifiesMemory = false;
+      for (BasicBlock *BB : L.getBlocks()) {
+        for (Instruction &Inst : *BB) {
+          if (Inst.mayWriteToMemory()) {
+            loopModifiesMemory = true;
+            break; 
+          }
+        }
+        if (loopModifiesMemory) break;
+      }
 
-        // 3. Iterative Worklist (Same structure as your standard pass)
-        SmallVector<Instruction *, 16> Worklist;
-        DenseSet<Instruction *> HoistedSet;
-        SmallVector<Instruction *, 16> OrderedHoist;
+      SmallVector<Instruction *, 16> Worklist;
+      DenseSet<Instruction *> HoistedSet;
+      SmallVector<Instruction *, 16> OrderedHoist;
 
-        for (BasicBlock *BB : L.getBlocks())
-            for (Instruction &I : *BB)
-                Worklist.push_back(&I);
+      for (BasicBlock *BB : L.getBlocks())
+        for (Instruction &I : *BB)
+            Worklist.push_back(&I);
 
-        // Re-build and use your custom Dominator_Tree
-        Dominator_Tree DT;
-        DT.build(*F);
+      Dominator_Tree DT;
+      DT.build(*F);
 
-        while (!Worklist.empty()) {
-            Instruction *I = Worklist.pop_back_val();
-            if (HoistedSet.count(I)) continue;
+      while (!Worklist.empty()) {
+        Instruction *I = Worklist.pop_back_val();
+        if (HoistedSet.count(I)) continue;
 
-            // Use the Relaxed Invariance Rule + your custom Dominator Tree logic
-            if (isAggressiveInvariant(*I, L, HoistedSet, MemoryWriters, AR.AA)) {
-
-                SmallVector<BasicBlock *, 4> ExitingBlocks;
-                L.getExitingBlocks(ExitingBlocks);
-                
-                bool dominatesAllExits = true;
-                for (BasicBlock *EB : ExitingBlocks) {
-                    if (!DT.dominates(I->getParent(), EB)) {
-                        dominatesAllExits = false;
-                        break;
-                    }
-                }
-
-                if (dominatesAllExits || isSafeToSpeculativelyExecute(I)) {
-                    errs() << "    [AGGRESSIVE HOIST] " << *I << "\n";
-                    HoistedSet.insert(I);
-                    OrderedHoist.push_back(I);
-
-                    for (User *U : I->users())
-                        if (auto *UI = dyn_cast<Instruction>(U))
-                            if (L.contains(UI->getParent()))
-                                Worklist.push_back(UI);
-                }
+        //Pass flag into the invariant check
+        if (isAggressiveInvariant(*I, L, HoistedSet, loopModifiesMemory)) {
+          SmallVector<BasicBlock *, 4> ExitingBlocks;
+          L.getExitingBlocks(ExitingBlocks);
+          
+          bool dominatesAllExits = true;
+          for (BasicBlock *EB : ExitingBlocks) {
+            if (!DT.dominates(I->getParent(), EB)) {
+                dominatesAllExits = false;
+                break;
             }
+          }
+
+          if (dominatesAllExits || isSafeToSpeculativelyExecute(I)) {
+            errs() << "    [AGGRESSIVE HOIST] " << *I << "\n";
+            HoistedSet.insert(I);
+            OrderedHoist.push_back(I);
+
+            for (User *U : I->users())
+                if (auto *UI = dyn_cast<Instruction>(U))
+                    if (L.contains(UI->getParent()))
+                        Worklist.push_back(UI);
+          }
         }
+      }
 
-        if (OrderedHoist.empty()) return PreservedAnalyses::all();
+      if (OrderedHoist.empty()) return PreservedAnalyses::all();
 
-        Instruction *PreheaderTerminator = Preheader->getTerminator();
-        auto InsertPos = PreheaderTerminator->getIterator();
-        for (Instruction *Inst : OrderedHoist) {
-            Inst->moveBefore(InsertPos);
-        }
+      Instruction *PreheaderTerminator = Preheader->getTerminator();
+      auto InsertPos = PreheaderTerminator->getIterator();
+      for (Instruction *Inst : OrderedHoist) {
+          Inst->moveBefore(InsertPos);
+      }
 
-        return PreservedAnalyses::none();
+      return PreservedAnalyses::none();
     }
   };
 

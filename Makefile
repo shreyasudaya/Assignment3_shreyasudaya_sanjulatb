@@ -55,7 +55,7 @@ $(TESTDIR)/%.bc: tests/%.c
 # This uses the built-in mem2reg pass
 $(TESTDIR)/%-m2r.bc: $(TESTDIR)/%.bc
 	@mkdir -p $(dir $@)
-	opt -passes=mem2reg $< -o $@
+	opt -passes=mem2reg,loop-simplify $< -o $@
 
 # Step C: SSA Bitcode -> Optimized Bitcode (Running your Plugin)
 $(TESTDIR)/%-opt.bc: $(TESTDIR)/%-m2r.bc $(OPTIMIZER_LIBS)
